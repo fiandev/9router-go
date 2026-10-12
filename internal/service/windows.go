@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
 )
 
@@ -10,7 +9,7 @@ import (
 const windowsTaskName = "9router-go"
 
 func installWindowsTask(exe string, args []string) (Info, error) {
-	if runtime.GOOS != "windows" {
+	if goos != "windows" {
 		return Info{}, fmt.Errorf("service.Install: windows-task backend only runs on windows")
 	}
 	taskCmd := commandLine(exe, args)
@@ -25,7 +24,7 @@ func installWindowsTask(exe string, args []string) (Info, error) {
 }
 
 func uninstallWindowsTask() (Info, bool) {
-	if runtime.GOOS != "windows" {
+	if goos != "windows" {
 		return Info{}, false
 	}
 	out, err := run("schtasks.exe", "/query", "/tn", windowsTaskName)
@@ -38,7 +37,7 @@ func uninstallWindowsTask() (Info, bool) {
 }
 
 func statusWindowsTask() (Info, bool) {
-	if runtime.GOOS != "windows" {
+	if goos != "windows" {
 		return Info{}, false
 	}
 	out, err := run("schtasks.exe", "/query", "/tn", windowsTaskName)

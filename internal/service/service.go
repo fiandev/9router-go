@@ -34,6 +34,26 @@ const (
 // ErrNotInstalled is returned when no autostart entry exists to remove.
 var ErrNotInstalled = errors.New("9router-go autostart is not installed")
 
+// Test seams. CI only runs one OS, so the live host facts detection and the
+// Windows guard depend on are read through these instead of the runtime
+// directly; tests swap them to drive every OS, privilege, and init branch from
+// a single runner. They are package-private and never exported.
+var (
+	goos     = runtime.GOOS
+	geteuid  = os.Geteuid
+	lookPath = func(name string) string {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return ""
+		}
+		return path
+	}
+	isDir = func(path string) bool {
+		st, err := os.Stat(path)
+		return err == nil && st.IsDir()
+	}
+)
+
 // Info describes an installed (or just-installed) autostart entry.
 type Info struct {
 	Backend Backend
@@ -67,7 +87,7 @@ func Install(extraArgs []string) (Info, error) {
 	case BackendWindowsTask:
 		return installWindowsTask(exe, extraArgs)
 	default:
-		return Info{}, fmt.Errorf("service.Install: no supported autostart backend found on %s", runtime.GOOS)
+		return Info{}, fmt.Errorf("service.Install: no supported autostart backend found on %s", goos)
 	}
 }
 
@@ -123,13 +143,13 @@ func Status() (Info, bool) {
 // 9ROUTER_SERVICE_BACKEND env var forces one (systemd, launchd, openrc,
 // runit, cron) for machines with several inits or for testing.
 func Detect() Backend {
-	if runtime.GOOS == "windows" {
+	if goos == "windows" {
 		if lookPath("schtasks.exe") != "" {
 			return BackendWindowsTask
 		}
 		return BackendNone
 	}
-	if runtime.GOOS == "darwin" {
+	if goos == "darwin" {
 		return BackendLaunchd
 	}
 	if forced := strings.TrimSpace(os.Getenv(BackendOverrideEnv)); forced != "" {
@@ -137,13 +157,13 @@ func Detect() Backend {
 		case BackendSystemdUser, BackendSystemdSys, BackendLaunchd, BackendOpenRC, BackendRunit, BackendCron:
 			return Backend(forced)
 		case "systemd", "system":
-			if os.Geteuid() == 0 {
-				return BackendSystemdSys
-			}
+			// The plain alias is the unprivileged user unit: autostart must
+			// not silently require root. The system scope stays reachable
+			// only through the explicit systemd-system backend.
 			return BackendSystemdUser
 		}
 	}
-	if runtime.GOOS != "linux" {
+	if goos != "linux" {
 		if hasCron() {
 			return BackendCron
 		}
@@ -151,9 +171,6 @@ func Detect() Backend {
 	}
 	switch {
 	case hasSystemd():
-		if os.Geteuid() == 0 {
-			return BackendSystemdSys
-		}
 		return BackendSystemdUser
 	case hasOpenRC():
 		return BackendOpenRC
@@ -173,10 +190,7 @@ func hasSystemd() bool {
 	if lookPath("systemctl") == "" {
 		return false
 	}
-	if st, err := os.Stat("/run/systemd/system"); err == nil && st.IsDir() {
-		return true
-	}
-	return false
+	return isDir("/run/systemd/system")
 }
 
 func hasOpenRC() bool {
@@ -187,22 +201,11 @@ func hasRunit() bool {
 	if lookPath("sv") != "" {
 		return true
 	}
-	if st, err := os.Stat("/run/runit"); err == nil && st.IsDir() {
-		return true
-	}
-	return false
+	return isDir("/run/runit")
 }
 
 func hasCron() bool {
 	return lookPath("crontab") != ""
-}
-
-func lookPath(name string) string {
-	path, err := exec.LookPath(name)
-	if err != nil {
-		return ""
-	}
-	return path
 }
 
 // run runs a helper command, returning its combined output for diagnostics.

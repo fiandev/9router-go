@@ -85,23 +85,26 @@ func statusCron() (Info, bool) {
 	return Info{Backend: BackendCron, Path: "crontab (@reboot)", Enabled: true}, true
 }
 
-func readCrontab() string {
-	cmd := exec.Command("crontab", "-l")
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
+// readCrontab and writeCrontab shell out to the real crontab(1). They are vars
+// so tests can drive the cron backend without a crontab binary present.
+var (
+	readCrontab = func() string {
+		cmd := exec.Command("crontab", "-l")
+		out, err := cmd.Output()
+		if err != nil {
+			return ""
+		}
+		return string(out)
 	}
-	return string(out)
-}
-
-func writeCrontab(content string) error {
-	cmd := exec.Command("crontab", "-")
-	cmd.Stdin = strings.NewReader(content)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("service.Install: write crontab: %w: %s", err, strings.TrimSpace(string(out)))
+	writeCrontab = func(content string) error {
+		cmd := exec.Command("crontab", "-")
+		cmd.Stdin = strings.NewReader(content)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("service.Install: write crontab: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
-	return nil
-}
+)
 
 func cronEntryPresent() bool {
 	for _, line := range strings.Split(readCrontab(), "\n") {

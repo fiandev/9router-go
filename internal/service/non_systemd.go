@@ -9,8 +9,17 @@ import (
 	"9router/proxy/internal/constants"
 )
 
-// openRCServicePath is the service script location on OpenRC hosts.
-const openRCServicePath = "/etc/init.d/9router-go"
+// openRCServicePath is the service script location on OpenRC hosts. It is a
+// var so tests can redirect the system-owned path onto a temp dir.
+var openRCServicePath = "/etc/init.d/9router-go"
+
+// runitSystemDir and runitSystemLink are the root-owned runit locations: the
+// supervised service directory and its /var/service activation symlink. They
+// are vars so tests can exercise the root branch without privileges.
+var (
+	runitSystemDir  = "/etc/sv/9router-go"
+	runitSystemLink = "/var/service/9router-go"
+)
 
 // renderOpenRCScript renders the OpenRC service script. It supervises the
 // gateway directly instead of forking a `9router-go start` daemon, so there
@@ -38,7 +47,7 @@ func openRCArgs(args []string) string {
 }
 
 func installOpenRC(exe string, args []string) (Info, error) {
-	if os.Geteuid() != 0 {
+	if geteuid() != 0 {
 		return Info{}, fmt.Errorf("service.Install: openrc needs root — re-run with sudo")
 	}
 	if err := os.WriteFile(openRCServicePath, []byte(renderOpenRCScript(exe, args)), 0755); err != nil {
@@ -81,8 +90,8 @@ func statusOpenRC() (Info, bool) {
 // runitServiceDir resolves the service directory: the system tree when root,
 // a ~/service tree otherwise (supervised by the user's own runsvdir).
 func runitServiceDir() string {
-	if os.Geteuid() == 0 {
-		return filepath.Join(string(filepath.Separator)+"etc", "sv", "9router-go")
+	if geteuid() == 0 {
+		return runitSystemDir
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -94,7 +103,7 @@ func runitServiceDir() string {
 // runitTarget is the argument sv takes: the service name under the system
 // supervisor, the service directory under a user's own runsvdir.
 func runitTarget() string {
-	if os.Geteuid() == 0 {
+	if geteuid() == 0 {
 		return "9router-go"
 	}
 	return runitServiceDir()
@@ -121,9 +130,8 @@ func installRunit(exe string, args []string) (Info, error) {
 		return Info{}, fmt.Errorf("service.Install: write %s: %w", runPath, err)
 	}
 	info := Info{Backend: BackendRunit, Path: runPath, Exec: commandLine(exe, args), Enabled: true}
-	if os.Geteuid() == 0 {
-		link := filepath.Join(string(filepath.Separator)+"var", "service", "9router-go")
-		_ = os.Symlink(dir, link)
+	if geteuid() == 0 {
+		_ = os.Symlink(dir, runitSystemLink)
 		if _, err := run("sv", "start", "9router-go"); err == nil {
 			info.Active = true
 		}
@@ -144,9 +152,9 @@ func uninstallRunit() (Info, bool) {
 	if _, err := os.Stat(runPath); err != nil {
 		return Info{}, false
 	}
-	if os.Geteuid() == 0 {
+	if geteuid() == 0 {
 		_, _ = run("sv", "stop", "9router-go")
-		_ = os.Remove(filepath.Join(string(filepath.Separator)+"var", "service", "9router-go"))
+		_ = os.Remove(runitSystemLink)
 	} else {
 		_, _ = run("sv", "stop", dir)
 	}

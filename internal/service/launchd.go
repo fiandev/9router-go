@@ -14,7 +14,7 @@ import (
 const launchdLabel = "com.9router.gateway"
 
 func launchdPlistPath() string {
-	home, err := os.UserHomeDir()
+	home, err := userHomeDir()
 	if err != nil {
 		return ""
 	}

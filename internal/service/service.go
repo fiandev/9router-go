@@ -22,7 +22,6 @@ type Backend string
 const (
 	BackendNone        Backend = "none"
 	BackendSystemdUser Backend = "systemd-user"
-	BackendSystemdSys  Backend = "systemd-system"
 	BackendLaunchd     Backend = "launchd"
 	BackendOpenRC      Backend = "openrc"
 	BackendRunit       Backend = "runit"
@@ -39,9 +38,15 @@ var ErrNotInstalled = errors.New("9router-go autostart is not installed")
 // directly; tests swap them to drive every OS, privilege, and init branch from
 // a single runner. They are package-private and never exported.
 var (
-	goos     = runtime.GOOS
-	geteuid  = os.Geteuid
-	lookPath = func(name string) string {
+	goos = runtime.GOOS
+	// userHomeDir resolves the home directory the user-scoped backends write
+	// to. It is a seam, not a HOME lookup: os.UserHomeDir reads %USERPROFILE%
+	// on Windows, so a test that only overrode HOME would resolve to the
+	// runner's real home and write the systemd unit, launchd plist, and
+	// autostart desktop entry there.
+	userHomeDir = os.UserHomeDir
+	geteuid     = os.Geteuid
+	lookPath    = func(name string) string {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			return ""
@@ -73,9 +78,7 @@ func Install(extraArgs []string) (Info, error) {
 	}
 	switch Detect() {
 	case BackendSystemdUser:
-		return installSystemd(exe, extraArgs, false)
-	case BackendSystemdSys:
-		return installSystemd(exe, extraArgs, true)
+		return installSystemd(exe, extraArgs)
 	case BackendLaunchd:
 		return installLaunchd(exe, extraArgs)
 	case BackendOpenRC:
@@ -95,10 +98,7 @@ func Install(extraArgs []string) (Info, error) {
 // whichever backend owns it. It reports the entries it removed.
 func Uninstall() ([]Info, error) {
 	removed := []Info{}
-	if info, ok := uninstallSystemd(false); ok {
-		removed = append(removed, info)
-	}
-	if info, ok := uninstallSystemd(true); ok {
+	if info, ok := uninstallSystemd(); ok {
 		removed = append(removed, info)
 	}
 	if info, ok := uninstallLaunchd(); ok {
@@ -141,8 +141,22 @@ func Status() (Info, bool) {
 
 // Detect picks the backend Install will use on this machine. The
 // 9ROUTER_SERVICE_BACKEND env var forces one (systemd, launchd, openrc,
-// runit, cron) for machines with several inits or for testing.
+// runit, cron) for machines with several inits or for testing. The override is
+// read before the OS short-circuits so it is authoritative on every platform:
+// a pinned backend must win even on Windows, where the schtasks check would
+// otherwise return before the env var is ever consulted.
 func Detect() Backend {
+	if forced := strings.TrimSpace(os.Getenv(BackendOverrideEnv)); forced != "" {
+		switch Backend(forced) {
+		case BackendSystemdUser, BackendLaunchd, BackendOpenRC, BackendRunit, BackendCron:
+			return Backend(forced)
+		case "systemd", "system", "systemd-system":
+			// This package only manages the unprivileged per-user unit, so
+			// every systemd alias (including the retired "systemd-system")
+			// resolves to it. There is no root-owned scope to opt into.
+			return BackendSystemdUser
+		}
+	}
 	if goos == "windows" {
 		if lookPath("schtasks.exe") != "" {
 			return BackendWindowsTask
@@ -151,17 +165,6 @@ func Detect() Backend {
 	}
 	if goos == "darwin" {
 		return BackendLaunchd
-	}
-	if forced := strings.TrimSpace(os.Getenv(BackendOverrideEnv)); forced != "" {
-		switch Backend(forced) {
-		case BackendSystemdUser, BackendSystemdSys, BackendLaunchd, BackendOpenRC, BackendRunit, BackendCron:
-			return Backend(forced)
-		case "systemd", "system":
-			// The plain alias is the unprivileged user unit: autostart must
-			// not silently require root. The system scope stays reachable
-			// only through the explicit systemd-system backend.
-			return BackendSystemdUser
-		}
 	}
 	if goos != "linux" {
 		if hasCron() {
@@ -173,6 +176,9 @@ func Detect() Backend {
 	case hasSystemd():
 		return BackendSystemdUser
 	case hasOpenRC():
+		// OpenRC is detected whenever it is the host's init; it has no
+		// per-user scope, so installOpenRC refuses without root instead of
+		// substituting another backend.
 		return BackendOpenRC
 	case hasRunit():
 		return BackendRunit

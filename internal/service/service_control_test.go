@@ -169,18 +169,3 @@ func TestOpenRCArgs(t *testing.T) {
 		t.Errorf("openRCArgs() = %q, want each arg quoted", got)
 	}
 }
-
-func TestScopeBackendAndSystemdScope(t *testing.T) {
-	if got := scopeBackend(true); got != BackendSystemdSys {
-		t.Errorf("scopeBackend(true) = %q, want %q", got, BackendSystemdSys)
-	}
-	if got := scopeBackend(false); got != BackendSystemdUser {
-		t.Errorf("scopeBackend(false) = %q, want %q", got, BackendSystemdUser)
-	}
-	if got := systemdScope(true); got != nil {
-		t.Errorf("systemdScope(true) = %v, want nil", got)
-	}
-	if got := systemdScope(false); !slices.Equal(got, []string{"--user"}) {
-		t.Errorf("systemdScope(false) = %v, want [--user]", got)
-	}
-}

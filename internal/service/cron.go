@@ -36,7 +36,7 @@ func renderAutostartDesktop(exe string, args []string) string {
 }
 
 func autostartDesktopPath() string {
-	home, err := os.UserHomeDir()
+	home, err := userHomeDir()
 	if err != nil {
 		return ""
 	}

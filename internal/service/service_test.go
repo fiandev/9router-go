@@ -28,28 +28,18 @@ func stubRun(t *testing.T) *[]svcCall {
 	return calls
 }
 
+// TestSystemdScope pins the single choke point that keeps every systemctl call
+// on the per-user manager: this package never touches the system bus.
 func TestSystemdScope(t *testing.T) {
-	tests := []struct {
-		name   string
-		system bool
-		want   []string
-	}{
-		{"user unit targets the per-user manager", false, []string{"--user"}},
-		{"system unit targets the system manager", true, nil},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := systemdScope(tt.system); !slices.Equal(got, tt.want) {
-				t.Errorf("systemdScope(%v) = %v, want %v", tt.system, got, tt.want)
-			}
-		})
+	if got := systemdScope(); !slices.Equal(got, []string{"--user"}) {
+		t.Errorf("systemdScope() = %v, want [--user]", got)
 	}
 }
 
 func TestRenderSystemdUnit(t *testing.T) {
 	t.Run("user unit wants default target", func(t *testing.T) {
 		t.Setenv("DATA_DIR", "")
-		unit := renderSystemdUnit("/usr/local/bin/9router-go", []string{"--rtk=true"}, false)
+		unit := renderSystemdUnit("/usr/local/bin/9router-go", []string{"--rtk=true"})
 		for _, want := range []string{
 			"Description=9router-go",
 			"ExecStart=/usr/local/bin/9router-go --rtk=true",
@@ -66,17 +56,9 @@ func TestRenderSystemdUnit(t *testing.T) {
 		}
 	})
 
-	t.Run("system unit wants multi-user target", func(t *testing.T) {
-		t.Setenv("DATA_DIR", "")
-		unit := renderSystemdUnit("/opt/9router-go/9router-go", nil, true)
-		if !strings.Contains(unit, "WantedBy=multi-user.target") {
-			t.Errorf("system unit must target multi-user:\n%s", unit)
-		}
-	})
-
 	t.Run("shell DATA_DIR is baked in", func(t *testing.T) {
 		t.Setenv("DATA_DIR", "/data/custom dir")
-		unit := renderSystemdUnit("/usr/local/bin/9router-go", nil, false)
+		unit := renderSystemdUnit("/usr/local/bin/9router-go", nil)
 		if !strings.Contains(unit, `Environment="DATA_DIR=/data/custom dir"`) {
 			t.Errorf("unit must preserve exported DATA_DIR:\n%s", unit)
 		}
@@ -84,7 +66,7 @@ func TestRenderSystemdUnit(t *testing.T) {
 
 	t.Run("paths with spaces are quoted", func(t *testing.T) {
 		t.Setenv("DATA_DIR", "")
-		unit := renderSystemdUnit("/opt/my apps/9router-go", nil, false)
+		unit := renderSystemdUnit("/opt/my apps/9router-go", nil)
 		if !strings.Contains(unit, `ExecStart="/opt/my apps/9router-go"`) {
 			t.Errorf("ExecStart must quote spaced paths:\n%s", unit)
 		}
@@ -199,8 +181,8 @@ func TestDetectOverride(t *testing.T) {
 		t.Errorf("Detect() = %q, want %q", got, BackendCron)
 	}
 	t.Setenv(BackendOverrideEnv, "systemd-system")
-	if got := Detect(); got != BackendSystemdSys {
-		t.Errorf("Detect() = %q, want %q", got, BackendSystemdSys)
+	if got := Detect(); got != BackendSystemdUser {
+		t.Errorf("Detect() = %q, want %q (the retired system scope degrades to the user unit)", got, BackendSystemdUser)
 	}
 }
 
@@ -227,8 +209,7 @@ func TestQuoteArg(t *testing.T) {
 // --user: the calls hit the system manager, prompted for root, and left the
 // user unit enabled.
 func TestUninstallSystemdUserScopesEveryCall(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setHome(t)
 	unit := filepath.Join(home, ".config", "systemd", "user", unitName)
 	if err := os.MkdirAll(filepath.Dir(unit), 0o755); err != nil {
 		t.Fatal(err)
@@ -238,8 +219,8 @@ func TestUninstallSystemdUserScopesEveryCall(t *testing.T) {
 	}
 
 	calls := stubRun(t)
-	if _, ok := uninstallSystemd(false); !ok {
-		t.Fatal("uninstallSystemd(false) = false, want true")
+	if _, ok := uninstallSystemd(); !ok {
+		t.Fatal("uninstallSystemd() = false, want true")
 	}
 	if _, err := os.Stat(unit); !os.IsNotExist(err) {
 		t.Fatalf("unit file still present after uninstall: %v", err)
@@ -266,8 +247,7 @@ func TestUninstallSystemdUserScopesEveryCall(t *testing.T) {
 // TestUninstallLaunchdUnloadsBeforeRemove pins the cross-backend contract:
 // stop the supervisor before deleting its entry.
 func TestUninstallLaunchdUnloadsBeforeRemove(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setHome(t)
 	plist := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
 	if err := os.MkdirAll(filepath.Dir(plist), 0o755); err != nil {
 		t.Fatal(err)
@@ -295,8 +275,7 @@ func TestUninstallLaunchdUnloadsBeforeRemove(t *testing.T) {
 // TestUninstallLaunchdReportsFailureWhenRemovalFails ensures a failed delete
 // is not swallowed as success.
 func TestUninstallLaunchdReportsFailureWhenRemovalFails(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setHome(t)
 	plist := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
 	// A non-empty directory at the plist path: Stat succeeds but Remove fails.
 	if err := os.MkdirAll(filepath.Join(plist, "keep"), 0o755); err != nil {

@@ -3,9 +3,10 @@ package service
 import "testing"
 
 // TestDetect covers every branch of backend selection: the Windows and macOS
-// short-circuits, the override escape hatch (including "systemd"/"system"
-// privilege splitting), the generic non-Linux fallback, and the full Linux
-// init priority ladder.
+// short-circuits, the override escape hatch (whose systemd aliases all resolve
+// to the unprivileged user unit), the generic non-Linux fallback, and the full
+// Linux init priority ladder — including OpenRC, which is detected wherever it
+// is the host init and refused without root at install time.
 func TestDetect(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -29,8 +30,12 @@ func TestDetect(t *testing.T) {
 			goos: "darwin", want: BackendLaunchd,
 		},
 		{
-			name: "darwin ignores the override because the OS check wins",
-			goos: "darwin", override: "cron", bins: []string{"crontab"}, want: BackendLaunchd,
+			name: "override wins over the darwin short-circuit",
+			goos: "darwin", override: "cron", bins: []string{"crontab"}, want: BackendCron,
+		},
+		{
+			name: "override wins over the windows short-circuit",
+			goos: "windows", override: "cron", bins: []string{"schtasks.exe", "crontab"}, want: BackendCron,
 		},
 		{
 			name: "generic unix with cron picks cron",
@@ -55,6 +60,10 @@ func TestDetect(t *testing.T) {
 		{
 			name: "linux openrc via rc-service",
 			goos: "linux", bins: []string{"rc-service"}, want: BackendOpenRC,
+		},
+		{
+			name: "openrc is detected without root too; install enforces the root requirement",
+			goos: "linux", euid: 1000, bins: []string{"rc-service", "crontab"}, want: BackendOpenRC,
 		},
 		{
 			name: "linux runit via sv",
@@ -84,10 +93,6 @@ func TestDetect(t *testing.T) {
 		{
 			name: "override forces systemd-user",
 			goos: "linux", override: "systemd-user", want: BackendSystemdUser,
-		},
-		{
-			name: "override forces systemd-system",
-			goos: "linux", override: "systemd-system", want: BackendSystemdSys,
 		},
 		{
 			name: "override forces launchd even on linux",

@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -23,6 +24,7 @@ func TestWindowsTaskGuardsOffWindows(t *testing.T) {
 
 func TestInstallWindowsTaskOnWindows(t *testing.T) {
 	stubHost(t, hostStub{goos: "windows"})
+	stubWindowsTaskUser(t, "bima")
 	calls := stubRun(t)
 
 	info, err := installWindowsTask(`C:\9router-go.exe`, []string{"--rtk=true"})
@@ -35,15 +37,63 @@ func TestInstallWindowsTaskOnWindows(t *testing.T) {
 	if info.Path != windowsTaskName {
 		t.Errorf("Info.Path = %q, want %q", info.Path, windowsTaskName)
 	}
-	var created bool
-	for _, c := range *calls {
-		if c.name == "schtasks.exe" && slices.Contains(c.args, "/create") {
-			created = true
+	var create *svcCall
+	for i := range *calls {
+		if (*calls)[i].name == "schtasks.exe" && slices.Contains((*calls)[i].args, "/create") {
+			create = &(*calls)[i]
 		}
 	}
-	if !created {
-		t.Errorf("calls = %v, want a schtasks /create", *calls)
+	if create == nil {
+		t.Fatalf("calls = %v, want a schtasks /create", *calls)
 	}
+	// The task must not run as SYSTEM (it would read a different %APPDATA%
+	// data dir and need elevation to create) and must be a logon task.
+	if slices.Contains(create.args, "SYSTEM") {
+		t.Errorf("schtasks /create args = %v, must not run as SYSTEM", create.args)
+	}
+	if !slices.Contains(create.args, "onlogon") {
+		t.Errorf("schtasks /create args = %v, want /sc onlogon", create.args)
+	}
+	if !slices.Contains(create.args, "/it") {
+		t.Errorf("schtasks /create args = %v, want /it (interactive-only, no stored password)", create.args)
+	}
+	if slices.Contains(create.args, "/rp") {
+		t.Errorf("schtasks /create args = %v, must not store a password with /rp", create.args)
+	}
+	if !slices.Contains(create.args, "/ru") || !slices.Contains(create.args, "bima") {
+		t.Errorf("schtasks /create args = %v, want /ru for the installing user", create.args)
+	}
+	if slices.Contains(create.args, "/rl") {
+		t.Errorf("schtasks /create args = %v, must not request /rl highest", create.args)
+	}
+	if got := argAfter(create.args, "/tr"); got != `C:\9router-go.exe --rtk=true` {
+		t.Errorf("/tr value = %q, want the cmd.exe command line", got)
+	}
+}
+
+// TestWindowsCommandLineQuotesForCmd pins the quoting contract: the /tr value
+// is read by cmd.exe, so a spaced path is wrapped verbatim. strconv.Quote
+// (correct for the POSIX targets) would emit "C:\\Program Files\\..." and the
+// task would never fire when installed under C:\Program Files.
+func TestWindowsCommandLineQuotesForCmd(t *testing.T) {
+	got := windowsCommandLine(`C:\Program Files\9router\9router-go.exe`, []string{"--rtk=true"})
+	want := `"C:\Program Files\9router\9router-go.exe" --rtk=true`
+	if got != want {
+		t.Errorf("windowsCommandLine() = %q, want %q", got, want)
+	}
+	if strings.Contains(got, `\\`) {
+		t.Errorf("windowsCommandLine() = %q, must not escape backslashes for cmd.exe", got)
+	}
+}
+
+// argAfter returns the argument following flag, or "" when absent.
+func argAfter(args []string, flag string) string {
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 func TestInstallWindowsTaskErrorPaths(t *testing.T) {

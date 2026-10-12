@@ -8,10 +8,19 @@ import (
 	"testing"
 )
 
+// TestInstallOpenRCNeedsRoot: OpenRC is a system service with no per-user
+// scope, so a non-root install must fail with a clear hint rather than
+// silently installing a different backend.
 func TestInstallOpenRCNeedsRoot(t *testing.T) {
 	stubHost(t, hostStub{goos: "linux", euid: 1000})
+	crontab := stubCrontab(t, "")
+	stubRun(t)
+
 	if _, err := installOpenRC("/usr/local/bin/9router-go", nil); err == nil {
-		t.Fatal("installOpenRC() error = nil for a non-root user, want the sudo hint")
+		t.Fatal("installOpenRC() error = nil without root, want the root requirement")
+	}
+	if *crontab != "" {
+		t.Errorf("installOpenRC() wrote a crontab fallback, want to refuse: %q", *crontab)
 	}
 }
 
@@ -260,7 +269,7 @@ func TestInstallRunitErrorPaths(t *testing.T) {
 	})
 
 	t.Run("missing home is reported", func(t *testing.T) {
-		t.Setenv("HOME", "")
+		stubNoHome(t)
 		stubHost(t, hostStub{goos: "linux", euid: 1000})
 		if _, err := installRunit("/usr/local/bin/9router-go", nil); err == nil {
 			t.Error("installRunit() error = nil without a home directory")
@@ -302,7 +311,7 @@ func TestStatusRunit(t *testing.T) {
 	})
 
 	t.Run("missing home", func(t *testing.T) {
-		t.Setenv("HOME", "")
+		stubNoHome(t)
 		stubHost(t, hostStub{goos: "linux", euid: 1000})
 		if _, ok := statusRunit(); ok {
 			t.Error("statusRunit() ok = true without a home directory, want false")

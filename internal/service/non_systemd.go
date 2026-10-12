@@ -48,7 +48,10 @@ func openRCArgs(args []string) string {
 
 func installOpenRC(exe string, args []string) (Info, error) {
 	if geteuid() != 0 {
-		return Info{}, fmt.Errorf("service.Install: openrc needs root — re-run with sudo")
+		// OpenRC is a system service with no per-user scope: it genuinely
+		// needs root. Refuse rather than silently installing a different
+		// backend, and point at the unprivileged alternative.
+		return Info{}, fmt.Errorf("service.Install: openrc is a system service and needs root — re-run with sudo, or use a user-level backend with --backend cron")
 	}
 	if err := os.WriteFile(openRCServicePath, []byte(renderOpenRCScript(exe, args)), 0755); err != nil {
 		return Info{}, fmt.Errorf("service.Install: write %s: %w", openRCServicePath, err)
@@ -93,7 +96,7 @@ func runitServiceDir() string {
 	if geteuid() == 0 {
 		return runitSystemDir
 	}
-	home, err := os.UserHomeDir()
+	home, err := userHomeDir()
 	if err != nil {
 		return ""
 	}

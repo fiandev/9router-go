@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -83,12 +84,40 @@ func stubCrontab(t *testing.T, initial string) *string {
 }
 
 // setHome points the user-scoped paths (systemd user unit, launchd plist,
-// autostart desktop, runit ~/service) at a fresh temp home.
+// autostart desktop, runit ~/service) at a fresh temp home. It swaps the
+// userHomeDir seam rather than HOME: os.UserHomeDir reads %USERPROFILE% on
+// Windows, so a HOME-only override resolves to the runner's real home there
+// and the tests would write into it.
 func setHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	stubUserHomeDir(t, home, nil)
 	return home
+}
+
+// stubNoHome simulates a machine with no resolvable home directory, which the
+// user-scoped backends must reject rather than fall back to a real path.
+func stubNoHome(t *testing.T) {
+	t.Helper()
+	stubUserHomeDir(t, "", errors.New("no home directory"))
+}
+
+// stubUserHomeDir swaps the home-directory seam. A non-nil err simulates a
+// machine where the home cannot be resolved.
+func stubUserHomeDir(t *testing.T, home string, err error) {
+	t.Helper()
+	previous := userHomeDir
+	userHomeDir = func() (string, error) { return home, err }
+	t.Cleanup(func() { userHomeDir = previous })
+}
+
+// stubWindowsTaskUser pins the account the Windows scheduled task is created
+// for, so tests do not depend on the runner's USERNAME.
+func stubWindowsTaskUser(t *testing.T, user string) {
+	t.Helper()
+	previous := windowsTaskUser
+	windowsTaskUser = func() string { return user }
+	t.Cleanup(func() { windowsTaskUser = previous })
 }
 
 func writeFile(t *testing.T, path, content string) {

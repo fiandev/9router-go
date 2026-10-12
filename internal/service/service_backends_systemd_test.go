@@ -13,7 +13,7 @@ func TestInstallSystemdUserWritesAndEnablesUnit(t *testing.T) {
 	home := setHome(t)
 	calls := stubRun(t)
 
-	info, err := installSystemd("/usr/local/bin/9router-go", []string{"--rtk=true"}, false)
+	info, err := installSystemd("/usr/local/bin/9router-go", []string{"--rtk=true"})
 	if err != nil {
 		t.Fatalf("installSystemd() error = %v", err)
 	}
@@ -67,7 +67,7 @@ func TestInstallSystemdErrorPaths(t *testing.T) {
 				return "", nil
 			})
 
-			info, err := installSystemd("/usr/local/bin/9router-go", nil, false)
+			info, err := installSystemd("/usr/local/bin/9router-go", nil)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("installSystemd() err = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -116,7 +116,7 @@ func TestStatusSystemdUser(t *testing.T) {
 func TestControlSystemd(t *testing.T) {
 	t.Run("start waits for the unit to become active", func(t *testing.T) {
 		stubRun(t)
-		if err := controlSystemd(false, "start"); err != nil {
+		if err := controlSystemd("start"); err != nil {
 			t.Errorf("controlSystemd(start) error = %v", err)
 		}
 	})
@@ -128,24 +128,21 @@ func TestControlSystemd(t *testing.T) {
 			}
 			return "", nil
 		})
-		if err := controlSystemd(false, "stop"); err != nil {
+		if err := controlSystemd("stop"); err != nil {
 			t.Errorf("controlSystemd(stop) error = %v", err)
 		}
 	})
 
 	t.Run("unknown operation is rejected", func(t *testing.T) {
 		stubRun(t)
-		if err := controlSystemd(false, "explode"); err == nil {
+		if err := controlSystemd("explode"); err == nil {
 			t.Error("controlSystemd(explode) error = nil, want error")
 		}
 	})
 }
 
 func TestLogHint(t *testing.T) {
-	if got := logHint(true); !strings.Contains(got, "journalctl -u") {
-		t.Errorf("logHint(system) = %q, want the system journal", got)
-	}
-	if got := logHint(false); !strings.Contains(got, "journalctl --user") {
-		t.Errorf("logHint(user) = %q, want the user journal", got)
+	if got := logHint(); !strings.Contains(got, "journalctl --user") {
+		t.Errorf("logHint() = %q, want the user journal", got)
 	}
 }

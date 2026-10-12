@@ -42,9 +42,7 @@ func control(op string) (Info, error) {
 	var err error
 	switch info.Backend {
 	case BackendSystemdUser:
-		err = controlSystemd(false, op)
-	case BackendSystemdSys:
-		err = controlSystemd(true, op)
+		err = controlSystemd(op)
 	case BackendLaunchd:
 		err = controlLaunchd(op)
 	case BackendOpenRC:
@@ -67,21 +65,17 @@ func control(op string) (Info, error) {
 	return info, nil
 }
 
-func controlSystemd(system bool, op string) error {
-	scope := []string{}
-	if !system {
-		scope = []string{"--user"}
-	}
-	if _, err := run("systemctl", append(append([]string{}, scope...), op, unitName)...); err != nil {
+func controlSystemd(op string) error {
+	if _, err := systemctl(op, unitName); err != nil {
 		return err
 	}
 	switch op {
 	case "start", "restart":
-		if !waitSystemdActive(scope) {
-			return fmt.Errorf("service: %s did not become active after %s (logs: %s)", unitName, op, logHint(system))
+		if !waitSystemdActive() {
+			return fmt.Errorf("service: %s did not become active after %s (logs: %s)", unitName, op, logHint())
 		}
 	case "stop":
-		if !waitSystemdInactive(scope) {
+		if !waitSystemdInactive() {
 			return fmt.Errorf("service: %s did not stop after %s", unitName, op)
 		}
 	default:
@@ -90,20 +84,16 @@ func controlSystemd(system bool, op string) error {
 	return nil
 }
 
-// logHint points at the journal scope that actually holds the unit's logs:
-// a user unit never appears in the system journal.
-func logHint(system bool) string {
-	if system {
-		return "journalctl -u 9router-go.service"
-	}
+// logHint points at the user journal, the only scope this package manages.
+func logHint() string {
 	return "journalctl --user -u 9router-go.service"
 }
 
 // waitSystemdInactive polls until the unit leaves the active state.
-func waitSystemdInactive(scope []string) bool {
+func waitSystemdInactive() bool {
 	deadline := time.Now().Add(controlTimeout)
 	for {
-		if !systemctlActive(scope) {
+		if !systemctlActive() {
 			return true
 		}
 		if time.Now().After(deadline) {

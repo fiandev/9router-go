@@ -19,11 +19,6 @@ func serviceInstall(cCtx *cli.Context) error {
 			return fmt.Errorf("service install: %w", err)
 		}
 	}
-	if cCtx.Bool("system") {
-		if err := os.Setenv(service.BackendOverrideEnv, string(service.BackendSystemdSys)); err != nil {
-			return fmt.Errorf("service install: %w", err)
-		}
-	}
 	info, err := service.Install(forwardArgs(cCtx))
 	if err != nil {
 		return err
@@ -150,8 +145,6 @@ func inspectHint(backend service.Backend) string {
 	switch backend {
 	case service.BackendSystemdUser:
 		return "systemctl --user status 9router-go.service"
-	case service.BackendSystemdSys:
-		return "systemctl status 9router-go.service"
 	case service.BackendLaunchd:
 		return "launchctl list com.9router.gateway"
 	case service.BackendOpenRC:

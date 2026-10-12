@@ -50,7 +50,7 @@ func TestInstallLaunchdLoadFailure(t *testing.T) {
 }
 
 func TestLaunchdPlistPathNeedsHome(t *testing.T) {
-	t.Setenv("HOME", "")
+	stubNoHome(t)
 	if got := launchdPlistPath(); got != "" {
 		t.Errorf("launchdPlistPath() = %q, want empty without a home directory", got)
 	}
@@ -91,7 +91,7 @@ func TestStatusLaunchd(t *testing.T) {
 		if _, ok := statusLaunchd(); ok {
 			t.Error("statusLaunchd() ok = true without a plist, want false")
 		}
-		t.Setenv("HOME", "")
+		stubNoHome(t)
 		if _, ok := statusLaunchd(); ok {
 			t.Error("statusLaunchd() ok = true without a home directory, want false")
 		}
@@ -160,7 +160,7 @@ func TestControlLaunchd(t *testing.T) {
 	})
 
 	t.Run("missing home is reported", func(t *testing.T) {
-		t.Setenv("HOME", "")
+		stubNoHome(t)
 		stubRun(t)
 		if err := controlLaunchd("start"); err == nil {
 			t.Error("controlLaunchd(start) error = nil without a home directory")

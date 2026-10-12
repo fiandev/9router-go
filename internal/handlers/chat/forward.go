@@ -3,7 +3,7 @@ package chat
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	json "9router/proxy/internal/fastjson"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"9router/proxy/internal/constants"
+	"9router/proxy/internal/guardrails"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/semanticcache"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
 	internalproxy "9router/proxy/internal/proxy"
@@ -390,6 +392,16 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		metrics.ResponseBuf.Write(body)
 	}
 
+	// Outbound guardrails: the last point before the answer reaches the client.
+	// It sits after the empty-response check so a blocked body is not mistaken
+	// for a provider failure, and before the translate step so the policy sees
+	// the model's own words rather than a reshaped envelope.
+	filtered, gerr := guardrails.ApplyBuffered(ctx, body)
+	if gerr != nil {
+		return guardrailBlockedError()
+	}
+	body = filtered
+
 	// A /v1/responses client on a Chat Completions upstream needs the answer in
 	// the Responses shape; translate marks a Claude client, which it is not.
 	if translator.NeedsResponsesBridge(ctx) {
@@ -402,6 +414,15 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		// providers). ParseResponseUsage handles both formats.
 		if usage := translator.ParseResponseUsage(body); usage != nil {
 			translator.SetUsage(ctx, usage)
+		} else if usage := translator.ParseOllamaUsage(body); usage != nil {
+			// Ollama's native shape carries its counters at the top level, not
+			// under `usage`, so ParseResponseUsage finds nothing there.
+			translator.SetUsage(ctx, usage)
+		}
+		if h.SemanticCache != nil && h.SemanticCache.Enabled() {
+			if cachedReq := semanticcache.CachedRequestFromContext(ctx); cachedReq != nil {
+				_ = h.SemanticCache.Store(ctx, cachedReq, body, "application/json")
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -421,6 +442,11 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		log.Error("json", "translate error", "msg", errMsg)
 		handlerutil.WriteJSONError(w, http.StatusBadGateway, errMsg)
 		return errors.New(errMsg)
+	}
+	if h.SemanticCache != nil && h.SemanticCache.Enabled() {
+		if cachedReq := semanticcache.CachedRequestFromContext(ctx); cachedReq != nil {
+			_ = h.SemanticCache.Store(ctx, cachedReq, translated, "application/json")
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

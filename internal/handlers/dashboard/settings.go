@@ -19,6 +19,7 @@ import (
 	"9router/proxy/internal/auth"
 	"9router/proxy/internal/config"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/proxy"
 )
 
 // Dashboard client headers, matching the Next dashboard settings/database route.
@@ -106,6 +107,12 @@ func (h *DashboardHandler) HandleUpdateSettings(w http.ResponseWriter, r *http.R
 	if err := h.Repo.UpdateSettingsRaw(updates); err != nil {
 		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	if h.TokenSaver != nil {
+		if s, err := h.Repo.GetSettings(); err == nil && s != nil {
+			h.TokenSaver.UpdateFromSettings(s)
+		}
 	}
 
 	updated, err := h.Repo.GetSettingsRaw()
@@ -252,8 +259,10 @@ func (h *DashboardHandler) HandleProxyTest(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	tr := proxy.NewSafeTransport()
+	tr.Proxy = http.ProxyURL(parsed)
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+		Transport: tr,
 		Timeout:   timeout,
 	}
 	started := time.Now()
@@ -489,8 +498,29 @@ func (h *DashboardHandler) exportDatabase() (*databaseExport, error) {
 		`SELECT id, key, name, machineId, isActive, createdAt FROM apiKeys`); err != nil {
 		return nil, err
 	}
+	// The per-key model allowlist is a separate table, so selecting apiKeys
+	// alone drops it. A restored key would then silently allow every model
+	// again — the one outcome a restriction exists to prevent.
+	access, err := selectRows(db,
+		`SELECT api_key_id, model FROM api_key_model_access ORDER BY api_key_id, model`)
+	if err != nil {
+		return nil, err
+	}
+	allowlists := make(map[string][]string)
+	for _, row := range access {
+		keyID, _ := row["api_key_id"].(string)
+		model, _ := row["model"].(string)
+		if keyID != "" && model != "" {
+			allowlists[keyID] = append(allowlists[keyID], model)
+		}
+	}
 	for _, row := range out.APIKeys {
 		normalizeBool(row, "isActive")
+		if id, _ := row["id"].(string); id != "" {
+			if models := allowlists[id]; len(models) > 0 {
+				row["allowedModels"] = models
+			}
+		}
 	}
 
 	if out.Combos, err = selectRows(db,
@@ -531,6 +561,9 @@ func (h *DashboardHandler) importDatabase(payload map[string]any) error {
 		`DELETE FROM providerNodes`,
 		`DELETE FROM proxyPools`,
 		`DELETE FROM apiKeys`,
+		// Without this the access rows outlive their key and accumulate as
+		// orphans after every import.
+		`DELETE FROM api_key_model_access`,
 		`DELETE FROM combos`,
 		`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`,
 	}
@@ -621,12 +654,29 @@ func (h *DashboardHandler) importDatabase(payload map[string]any) error {
 		if !ok {
 			continue
 		}
+		keyID, _ := k["id"].(string)
+		if keyID == "" {
+			continue
+		}
 		if _, err := tx.Exec(
 			`INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
 			k["id"], k["key"], stringDefault(k["name"], nil), stringDefault(k["machineId"], nil),
 			boolToInt(k["isActive"]), stringDefault(k["createdAt"], nowISO()),
 		); err != nil {
 			return err
+		}
+		models, _ := k["allowedModels"].([]any)
+		for _, raw := range models {
+			model, _ := raw.(string)
+			if model == "" {
+				continue
+			}
+			if _, err := tx.Exec(
+				`INSERT OR REPLACE INTO api_key_model_access(api_key_id, model) VALUES(?, ?)`,
+				keyID, model,
+			); err != nil {
+				return err
+			}
 		}
 	}
 

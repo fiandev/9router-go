@@ -140,7 +140,8 @@ const (
 var usageSupportedProviders = []string{
 	"antigravity", "claude", "codebuddy-cn", "codebuddy-intl", "codex",
 	"commandcode", "deepseek", "gemini-cli", "github", "glm", "glm-cn",
-	"grok-cli", "groq", "kimi", "kiro", "minimax", "minimax-cn", "ollama",
+	"grok-cli", "groq", "kimi", "kiro", "minimax", "minimax-cn", "minimax-code",
+	"minimax-code-global", "ollama",
 	"opencode-go", "opencode-zen", "qoder", "qoder-cn", "trae",
 	"vercel-ai-gateway", "xiaomi-mimo", "zed",
 }
@@ -312,6 +313,12 @@ func sanitizeProviderConnection(c *models.ProviderConnection) map[string]any {
 					} else {
 						safe[f] = fmt.Sprintf("%v", v)
 					}
+					if mdl, ok := m["model"].(string); ok && mdl != "" {
+						safe["lastErrorModel"] = mdl
+					}
+					if src, ok := m["source"].(string); ok && src != "" {
+						safe["lastErrorSource"] = src
+					}
 				} else if s, isStr := v.(string); isStr {
 					safe[f] = s
 				} else {
@@ -335,7 +342,7 @@ func sanitizeProviderConnection(c *models.ProviderConnection) map[string]any {
 			"connectionProxyEnabled", "connectionProxyUrl", "connectionNoProxy",
 			"githubLogin", "githubName", "githubEmail", "githubUserId",
 			"username", "firstName", "lastName", "authMethod", "authKind",
-			"profileArn",
+			"profileArn", "accessKeyId", "profile",
 		} {
 			if v, ok := psd[f]; ok && v != nil {
 				out[f] = v
@@ -821,6 +828,15 @@ func (h *DashboardHandler) HandleGetConnectionModels(w http.ResponseWriter, r *h
 		handlerutil.WriteJSONError(w, http.StatusBadRequest, "missing connection id")
 		return
 	}
+	h.writeConnectionModels(w, r, id)
+}
+
+// writeConnectionModels is HandleGetConnectionModels with the connection id
+// already resolved. The split exists because model sync (POST
+// /api/models/sync) needs the same discovery for a connection it selected
+// itself, and a second copy of this provider-by-provider chain would be free
+// to drift from the one the dashboard imports models with (#179).
+func (h *DashboardHandler) writeConnectionModels(w http.ResponseWriter, r *http.Request, id string) {
 	conn, err := h.Repo.GetProviderConnectionByID(id)
 	if err != nil || conn == nil {
 		handlerutil.WriteJSONError(w, http.StatusNotFound, "connection not found")

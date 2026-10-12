@@ -47,8 +47,21 @@ type CapacityAdapterEntry struct {
 // SettingsData represents token saver, combo routing, and general settings stored in the settings table.
 type SettingsData struct {
 	RTKEnabled                 bool                            `json:"rtkEnabled"`
+	RTKMode                    string                          `json:"rtkMode,omitempty"`
+	RTKIntensity               string                          `json:"rtkIntensity,omitempty"`
+	RTKMaxLines                int                             `json:"rtkMaxLines,omitempty"`
+	RTKMaxChars                int                             `json:"rtkMaxChars,omitempty"`
+	RTKDeduplicate             bool                            `json:"rtkDeduplicate,omitempty"`
+	RTKCategories              map[string]bool                 `json:"rtkCategories,omitempty"`
+	RTKFilters                 map[string]bool                 `json:"rtkFilters,omitempty"`
+	RTKRawRetention            string                          `json:"rtkRawRetention,omitempty"`
 	CavemanEnabled             bool                            `json:"cavemanEnabled"`
+	CavemanMode                string                          `json:"cavemanMode,omitempty"`
 	CavemanLevel               string                          `json:"cavemanLevel"`
+	CavemanAutoClarity         bool                            `json:"cavemanAutoClarity,omitempty"`
+	CavemanLanguage            string                          `json:"cavemanLanguage,omitempty"`
+	CavemanInputMode           bool                            `json:"cavemanInputMode,omitempty"`
+	CavemanPreserveKeywords    string                          `json:"cavemanPreserveKeywords,omitempty"`
 	PonytailEnabled            bool                            `json:"ponytailEnabled"`
 	PonytailLevel              string                          `json:"ponytailLevel"`
 	ADHDEnabled                bool                            `json:"adhdEnabled"`
@@ -57,6 +70,9 @@ type SettingsData struct {
 	HeadroomCodeAware          bool                            `json:"headroomCodeAware"`
 	HeadroomKompress           bool                            `json:"headroomKompress"`
 	HeadroomTimeoutMs          int                             `json:"headroomTimeoutMs"`
+	SemanticCacheEnabled       bool                            `json:"semanticCacheEnabled"`
+	SemanticCacheTTL           int                             `json:"semanticCacheTTL,omitempty"`
+	SemanticCacheMaxEntries    int                             `json:"semanticCacheMaxEntries,omitempty"`
 	AutoUpdate                 bool                            `json:"autoUpdate"`
 	FallbackStrategy           string                          `json:"fallbackStrategy,omitempty"`
 	StickyRoundRobinLimit      int                             `json:"stickyRoundRobinLimit,omitempty"`
@@ -67,21 +83,47 @@ type SettingsData struct {
 	ProviderStrategies         map[string]ProviderStrategy     `json:"providerStrategies,omitempty"`
 	CapacityAdapter            map[string]CapacityAdapterEntry `json:"capacityAdapter,omitempty"`
 	ProviderOverrides          map[string]ProviderOverrides    `json:"providerOverrides,omitempty"`
+	EnableObservability        bool                            `json:"enableObservability"`
+	ObservabilityMode          string                          `json:"observabilityMode,omitempty"`
+	RetentionDays              int                             `json:"retentionDays,omitempty"`
+	MaxRequestRecords          int                             `json:"maxRequestRecords,omitempty"`
 }
 
 // DefaultSettings returns fallback settings.
 func DefaultSettings() *SettingsData {
 	return &SettingsData{
 		RTKEnabled:        true,
-		CavemanEnabled:    false,
-		CavemanLevel:      "full",
-		PonytailEnabled:   false,
-		PonytailLevel:     "full",
-		ADHDEnabled:       false,
-		ADHDLevel:         "full",
+		RTKMode:           "simple",
+		RTKIntensity:      "standard",
+		RTKMaxLines:       100,
+		RTKMaxChars:       8000,
+		RTKDeduplicate:    true,
+		RTKCategories: map[string]bool{
+			"git":     true,
+			"build":   true,
+			"test":    true,
+			"package": true,
+			"docker":  true,
+			"system":  true,
+		},
+		RTKRawRetention:         "never",
+		CavemanEnabled:          false,
+		CavemanMode:             "simple",
+		CavemanLevel:            "full",
+		CavemanAutoClarity:      true,
+		CavemanLanguage:         "en",
+		CavemanInputMode:        false,
+		CavemanPreserveKeywords: "",
+		PonytailEnabled:         false,
+		PonytailLevel:           "full",
+		ADHDEnabled:             false,
+		ADHDLevel:               "full",
 		HeadroomUrl:       "http://localhost:8787",
 		HeadroomKompress:  true,
 		HeadroomTimeoutMs: 3000,
+		SemanticCacheEnabled:     false,
+		SemanticCacheTTL:         1440,
+		SemanticCacheMaxEntries:  1000,
 		AutoUpdate:        false,
 		CapacityAdapter: map[string]CapacityAdapterEntry{
 			"vision":     {Enabled: true, RoundRobin: false, Models: []string{}},
@@ -109,11 +151,60 @@ func (r *Repo) GetSettings() (*SettingsData, error) {
 	if v, ok := raw["rtkEnabled"].(bool); ok {
 		s.RTKEnabled = v
 	}
+	if v := handlerutil.GetString(raw, "rtkMode"); v != "" {
+		s.RTKMode = v
+	}
+	if v := handlerutil.GetString(raw, "rtkIntensity"); v != "" {
+		s.RTKIntensity = v
+	}
+	if v, ok := raw["rtkMaxLines"].(float64); ok && v > 0 {
+		s.RTKMaxLines = int(v)
+	}
+	if v, ok := raw["rtkMaxChars"].(float64); ok && v > 0 {
+		s.RTKMaxChars = int(v)
+	}
+	if v, ok := raw["rtkDeduplicate"].(bool); ok {
+		s.RTKDeduplicate = v
+	}
+	if cats, ok := raw["rtkCategories"].(map[string]any); ok {
+		s.RTKCategories = make(map[string]bool, len(cats))
+		for k, cv := range cats {
+			if b, ok := cv.(bool); ok {
+				s.RTKCategories[k] = b
+			}
+		}
+	}
+	if filts, ok := raw["rtkFilters"].(map[string]any); ok {
+		s.RTKFilters = make(map[string]bool, len(filts))
+		for k, fv := range filts {
+			if b, ok := fv.(bool); ok {
+				s.RTKFilters[k] = b
+			}
+		}
+	}
+	if v := handlerutil.GetString(raw, "rtkRawRetention"); v != "" {
+		s.RTKRawRetention = v
+	}
 	if v, ok := raw["cavemanEnabled"].(bool); ok {
 		s.CavemanEnabled = v
 	}
+	if v := handlerutil.GetString(raw, "cavemanMode"); v != "" {
+		s.CavemanMode = v
+	}
 	if lvl := handlerutil.GetString(raw, "cavemanLevel"); lvl != "" {
 		s.CavemanLevel = lvl
+	}
+	if v, ok := raw["cavemanAutoClarity"].(bool); ok {
+		s.CavemanAutoClarity = v
+	}
+	if v := handlerutil.GetString(raw, "cavemanLanguage"); v != "" {
+		s.CavemanLanguage = v
+	}
+	if v, ok := raw["cavemanInputMode"].(bool); ok {
+		s.CavemanInputMode = v
+	}
+	if v := handlerutil.GetString(raw, "cavemanPreserveKeywords"); v != "" {
+		s.CavemanPreserveKeywords = v
 	}
 	if v, ok := raw["ponytailEnabled"].(bool); ok {
 		s.PonytailEnabled = v
@@ -139,8 +230,31 @@ func (r *Repo) GetSettings() (*SettingsData, error) {
 	if v, ok := raw["headroomTimeoutMs"].(float64); ok && v > 0 {
 		s.HeadroomTimeoutMs = int(v)
 	}
+	if v, ok := raw["semanticCacheEnabled"].(bool); ok {
+		s.SemanticCacheEnabled = v
+	}
+	if v, ok := raw["semanticCacheTTL"].(float64); ok && v > 0 {
+		s.SemanticCacheTTL = int(v)
+	}
+	if v, ok := raw["semanticCacheMaxEntries"].(float64); ok && v > 0 {
+		s.SemanticCacheMaxEntries = int(v)
+	}
 	if v, ok := raw["autoUpdate"].(bool); ok {
 		s.AutoUpdate = v
+	}
+
+	// Observability & Storage retention settings
+	if v, ok := raw["enableObservability"].(bool); ok {
+		s.EnableObservability = v
+	}
+	if v := handlerutil.GetString(raw, "observabilityMode"); v != "" {
+		s.ObservabilityMode = v
+	}
+	if v := settingsInt(raw["retentionDays"]); v >= 0 && raw["retentionDays"] != nil {
+		s.RetentionDays = v
+	}
+	if v := settingsInt(raw["maxRequestRecords"]); v > 0 {
+		s.MaxRequestRecords = v
 	}
 
 	// Global provider fallback strategy
@@ -403,6 +517,112 @@ func (r *Repo) SetProviderOverride(provider string, override *ProviderOverrides)
 	}
 	return r.UpdateSettingsRaw(map[string]any{"providerOverrides": all})
 }
+
+// GetGuardrailsEnabled reports whether the guardrail taps are active at all.
+//
+// It reads the settings blob directly rather than through GetSettings because
+// it is consulted on the request path, twice per request, and needs one flag
+// rather than the whole struct.
+//
+// The default is true: a policy row is an explicit decision by the operator,
+// and silently ignoring it because a setting was never written would be the
+// more dangerous reading.
+func (r *Repo) GetGuardrailsEnabled() bool {
+	raw, err := r.GetSettingsRaw()
+	if err != nil || raw == nil {
+		return true
+	}
+	switch v := raw["guardrailsEnabled"].(type) {
+	case bool:
+		return v
+	case string:
+		// The blob is hand-editable through the backup import, so a quoted
+		// "false" is a real input rather than a bug to panic on.
+		return v != "false" && v != "0"
+	default:
+		return true
+	}
+}
+
+// SetGuardrailsEnabled stores the global guardrail kill-switch.
+func (r *Repo) SetGuardrailsEnabled(enabled bool) error {
+	return r.UpdateSettingsRaw(map[string]any{"guardrailsEnabled": enabled})
+}
+
+// RateLimitDefaults is the operator's fallback for keys that set no limit of
+// their own.
+//
+// The defaults apply only where a key's column is 0, so configuring a global
+// default never silently caps a key that was deliberately given a higher or
+// unlimited budget — and never lifts one that was capped. Resolution order is
+// key column, then plan (not ported yet), then this.
+type RateLimitDefaults struct {
+	// Enabled is the master switch. False leaves every key enforcing only what
+	// its own columns say.
+	Enabled     bool
+	RPM         int
+	TPM         int
+	Concurrency int
+	// WindowSeconds is the RPM/TPM window. Zero means the 60s default.
+	WindowSeconds int
+}
+
+// DefaultRateLimitSeconds is the sliding window used when the operator has not
+// chosen one. It matches the in-memory limiter's own default.
+const DefaultRateLimitSeconds = 60
+
+// GetRateLimitDefaults reads the global fallback from the settings blob.
+//
+// It is read on the request path, so it goes straight to the raw blob rather
+// than through GetSettings: a failed read must not stop a key's own limits from
+// being enforced, so every field falls back to the zero value rather than
+// erroring.
+func (r *Repo) GetRateLimitDefaults() RateLimitDefaults {
+	out := RateLimitDefaults{WindowSeconds: DefaultRateLimitSeconds}
+	raw, err := r.GetSettingsRaw()
+	if err != nil || raw == nil {
+		return out
+	}
+	if v, ok := raw["rateLimitEnabled"].(bool); ok {
+		out.Enabled = v
+	}
+	out.RPM = settingsInt(raw["defaultRpm"])
+	out.TPM = settingsInt(raw["defaultTpm"])
+	out.Concurrency = settingsInt(raw["defaultConcurrency"])
+	if w := settingsInt(raw["rateWindowSeconds"]); w > 0 {
+		out.WindowSeconds = w
+	}
+	return out
+}
+
+// SetRateLimitDefaults stores the global fallback.
+func (r *Repo) SetRateLimitDefaults(d RateLimitDefaults) error {
+	return r.UpdateSettingsRaw(map[string]any{
+		"rateLimitEnabled":   d.Enabled,
+		"defaultRpm":         d.RPM,
+		"defaultTpm":         d.TPM,
+		"defaultConcurrency": d.Concurrency,
+		"rateWindowSeconds":  d.WindowSeconds,
+	})
+}
+
+// settingsInt coerces a settings value to a non-negative int, treating a
+// missing or wrongly-typed entry as unset. The blob is hand-editable through
+// the backup import, so a string where a number belongs is a real input.
+func settingsInt(v any) int {
+	switch t := v.(type) {
+	case float64:
+		if t > 0 {
+			return int(t)
+		}
+	case int:
+		if t > 0 {
+			return t
+		}
+	}
+	return 0
+}
+
 
 // stringMap coerces a decoded JSON value into map[string]string, skipping
 // anything that is not a string. The settings blob is hand-editable through

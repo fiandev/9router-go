@@ -323,7 +323,7 @@ func TestHandleAccountFallback_503CapacityLocksCanonicalModel(t *testing.T) {
 		w.Write([]byte(`{
 			"error": {
 				"code": 503,
-				"message": "No capacity available for model gemini-3.8-flash-tiered on the server",
+			"message": "No capacity available for model gemini-3.7-flash-tiered on the server",
 				"status": "UNAVAILABLE",
 				"details": [{"reason": "MODEL_CAPACITY_EXHAUSTED"}]
 			}
@@ -348,26 +348,30 @@ func TestHandleAccountFallback_503CapacityLocksCanonicalModel(t *testing.T) {
 	repo := db.NewRepo(database)
 	h := NewChatHandler(repo)
 
-	body := []byte(`{"model":"gemini-3.8-flash-low","messages":[{"role":"user","content":"ping"}]}`)
+	body := []byte(`{"model":"gemini-3.7-flash-low","messages":[{"role":"user","content":"ping"}]}`)
 	rec := httptest.NewRecorder()
-	err := h.handleAccountFallback(context.Background(), rec, "antigravity", "gemini-3.8-flash-low", "", body, false, false, "/v1/chat/completions")
+	err := h.handleAccountFallback(context.Background(), rec, "antigravity", "gemini-3.7-flash-low", "", body, false, false, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error after 503 capacity exhaustion")
 	}
 
-	// Canonical model "gemini-3.8-flash-tiered" must be locked
-	lockedCanonical, err := repo.IsConnectionModelLocked("conn-ag-cap", "gemini-3.8-flash-tiered")
+	// The whole 3.7 family shares one backend id (gemini-3.7-flash-tiered), so
+	// exhausting the low tier exhausts every 3.7 tier and all of them must be
+	// locked. The 3.8 family is deliberately NOT tested here: upstream
+	// v0.5.99 gives each 3.8 tier its own backend id, so a capacity error on
+	// one tier says nothing about the others.
+	lockedCanonical, err := repo.IsConnectionModelLocked("conn-ag-cap", "gemini-3.7-flash-tiered")
 	if err != nil {
 		t.Fatalf("check canonical lock: %v", err)
 	}
 	if !lockedCanonical {
-		t.Error("expected canonical model gemini-3.8-flash-tiered to be locked on 503 capacity error")
+		t.Error("expected canonical model gemini-3.7-flash-tiered to be locked on 503 capacity error")
 	}
 
-	// Best connection for gemini-3.8-flash-high must now skip this connection because canonical tiered is locked!
+	// A different 3.8 tier keeps its own capacity, so it must remain eligible.
 	conn, _, _ := h.GetBestConnection("antigravity", "", nil, "gemini-3.8-flash-high")
-	if conn != nil {
-		t.Errorf("expected no connection available for high tier when canonical model is locked, got %s", conn.ID)
+	if conn == nil {
+		t.Error("expected gemini-3.8-flash-high to stay available: 3.8 tiers are separate backends")
 	}
 }
 
@@ -386,5 +390,28 @@ func TestExtractErrorText_CloudflareHTML(t *testing.T) {
 	got := extractErrorText(htmlBody)
 	if !strings.Contains(got, "Cloudflare WAF challenge") {
 		t.Errorf("expected Cloudflare WAF challenge in error text, got %q", got)
+	}
+}
+
+func TestHandleAccountFallback_AllInCooldownReportsEarliestReset(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+
+	dropSeededConn(t, database)
+	inTenMinutes := time.Now().UTC().Add(10 * time.Minute)
+	insertDeepseekConn(t, database, "conn-cooling", 1, cooldownData(t, &inTenMinutes))
+
+	h := NewChatHandler(db.NewRepo(database))
+	body := []byte(`{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`)
+	rec := httptest.NewRecorder()
+	err := h.handleAccountFallback(context.Background(), rec, "deepseek", "deepseek-chat", "", body, false, false, "/v1/chat/completions")
+	if err == nil {
+		t.Fatal("expected error when all connections are in cooldown")
+	}
+	if !strings.Contains(err.Error(), "all in cooldown") {
+		t.Errorf("expected error to contain 'all in cooldown', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), inTenMinutes.UTC().Format(time.RFC3339)) {
+		t.Errorf("expected error to contain earliest reset %s, got: %v", inTenMinutes.UTC().Format(time.RFC3339), err)
 	}
 }

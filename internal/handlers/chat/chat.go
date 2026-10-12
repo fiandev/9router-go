@@ -1,23 +1,45 @@
 package chat
 
 import (
+	"9router/proxy/internal/changelogfrag"
+	json "9router/proxy/internal/fastjson"
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/semanticcache"
 	"9router/proxy/internal/translator"
 	"9router/proxy/internal/updater"
 	"bytes"
 	"context"
-	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 )
+
+type cacheCaptureWriter struct {
+	http.ResponseWriter
+	body       bytes.Buffer
+	statusCode int
+}
+
+func (c *cacheCaptureWriter) WriteHeader(code int) {
+	c.statusCode = code
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *cacheCaptureWriter) Write(b []byte) (int, error) {
+	if c.statusCode == 0 {
+		c.statusCode = http.StatusOK
+	}
+	if c.statusCode == http.StatusOK {
+		c.body.Write(b)
+	}
+	return c.ResponseWriter.Write(b)
+}
 
 // HandleChatCompletions handles POST /v1/chat/completions (OpenAI format requests).
 func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -47,18 +69,58 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	modelInfo, err := h.resolveModel(reqBody.Model)
-	if err != nil {
-		handlerutil.WriteJSONError(w, http.StatusBadRequest, err.Error())
+	// Per-key model policy runs after the bypass path — synthetic warmup and
+	// keepalive traffic never reaches a provider, so it is not an access
+	// request — and before resolveModel, so a denied model never reaches
+	// connection selection.
+	if !h.enforceModelAccess(w, r, reqBody.Model) {
 		return
 	}
 
 	ctx := handlerutil.WithSessionID(r.Context(), handlerutil.ExtractSessionID(r))
 	ctx = handlerutil.WithClientAnthropicBeta(ctx, r.Header.Get("anthropic-beta"))
+	ctx = translator.WithRequestedModel(ctx, stripModelContextMarker(reqBody.Model))
+	// Record the dispatching key so the outbound guardrail tap can resolve the
+	// right policy. A keyless caller leaves it unset and the tap stays inert.
+	ctx = withGuardrailKey(ctx, requestKeyID(r))
+
+	// Check prompt/response cache for non-streaming requests before model
+	// resolution: a hit answers the turn without touching a provider, so it
+	// must not depend on the model resolving. resolveModel below is what turns
+	// an unknown model into a 400, and a cached answer for a model that has
+	// since been retired is still the answer this client already paid for.
+	if !reqBody.Stream && h.SemanticCache != nil && h.SemanticCache.Enabled() {
+		var openAIReq translator.OpenAIRequest
+		if err := json.Unmarshal(body, &openAIReq); err == nil {
+			if entry, score, hit := h.SemanticCache.Lookup(ctx, &openAIReq); hit {
+				w.Header().Set("Content-Type", entry.ContentType)
+				w.Header().Set("X-Cache", "HIT")
+				w.Header().Set("X-Semantic-Similarity", fmt.Sprintf("%.4f", score))
+				w.WriteHeader(http.StatusOK)
+				w.Write(entry.ResponseBody)
+				log.Info("chat", "semantic cache hit", "model", reqBody.Model, "similarity", fmt.Sprintf("%.4f", score))
+				return
+			}
+			capture := &cacheCaptureWriter{ResponseWriter: w}
+			w = capture
+			defer func() {
+				if capture.statusCode == http.StatusOK && capture.body.Len() > 0 {
+					_ = h.SemanticCache.Store(ctx, &openAIReq, capture.body.Bytes(), "application/json")
+				}
+			}()
+			ctx = semanticcache.WithCachedRequest(ctx, &openAIReq)
+		}
+	}
+
+	modelInfo, err := h.resolveModel(reqBody.Model)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	requiredCaps := DetectRequiredCapabilities(body)
 
 	if len(modelInfo.ComboModels) > 0 {
-		augmented, comboStrategy, injected := h.applyCapacityAdapter(modelInfo.ComboModels, requiredCaps, modelInfo.Strategy, reqBody.Model)
+		augmented, comboStrategy, injected := h.applyCapacityAdapter(modelInfo.ComboModels, requiredCaps, modelInfo.Strategy, reqBody.Model, requestKeyID(r))
 		if modelInfo.Strategy == "fusion" {
 			// Upstream hands the fusion panel the combo's own models, never the
 			// augmented list: a capacity-adapter model is a serial fallback, and
@@ -75,7 +137,7 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if !strings.Contains(targetEntry, "/") && modelInfo != nil && modelInfo.Provider != "" {
 		targetEntry = modelInfo.Provider + "/" + modelInfo.Model
 	}
-	augmented, strat := h.AugmentModelsWithCapacityAdapter([]string{targetEntry}, requiredCaps)
+	augmented, strat := h.AugmentModelsWithCapacityAdapter([]string{targetEntry}, requiredCaps, requestKeyID(r))
 	if len(augmented) > 1 {
 		injected := augmented[:len(augmented)-1]
 		log.Info("chat", "capacity adapter auto-switch", "target", reqBody.Model, "switched_to", augmented[0], "caps", keysString(requiredCaps))
@@ -99,8 +161,8 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 // absent from the combo appeared to leak out of it. An augmented list is
 // therefore governed by the adapter's own strategy; the combo's strategy
 // applies only when nothing was injected.
-func (h *ChatHandler) applyCapacityAdapter(comboModels []string, required map[string]bool, comboStrategy, requestedModel string) ([]string, string, []string) {
-	augmented, adapterStrategy := h.AugmentModelsWithCapacityAdapter(comboModels, required)
+func (h *ChatHandler) applyCapacityAdapter(comboModels []string, required map[string]bool, comboStrategy, requestedModel, keyID string) ([]string, string, []string) {
+	augmented, adapterStrategy := h.AugmentModelsWithCapacityAdapter(comboModels, required, keyID)
 	if len(augmented) == len(comboModels) {
 		return augmented, comboStrategy, nil
 	}
@@ -171,6 +233,12 @@ func (h *ChatHandler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-key model policy: 403 before any translation work or connection
+	// selection.
+	if !h.enforceModelAccess(w, r, reqBody.Model) {
+		return
+	}
+
 	modelInfo, err := h.resolveModel(reqBody.Model)
 	if err != nil {
 		log.Error("chat", "resolve model failed", "error", err, "model", reqBody.Model)
@@ -180,7 +248,18 @@ func (h *ChatHandler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	translateResponse := true
 	var workingBody map[string]any
-	if modelInfo.Provider == "claude" || modelInfo.Provider == "anthropic" {
+	// A provider whose registry entry declares the Claude Messages format is
+	// answered in that format, so a /v1/messages client is forwarded as-is
+	// instead of being converted to OpenAI first. Anthropic itself is the
+	// historical case; minimax-code serves the same wire on MiniMax's mavis
+	// gateway (open-sse/config/providers.js transport.format).
+	claudeNative := modelInfo.Provider == "claude" || modelInfo.Provider == "anthropic"
+	if !claudeNative {
+		if cfg, err := h.GetProviderConfig(modelInfo.Provider, nil); err == nil {
+			claudeNative = cfg != nil && cfg.Format == providers.FormatClaude
+		}
+	}
+	if claudeNative {
 		translateResponse = false
 		body = translator.SanitizeClaudePassthrough(body, translator.ClaudeIntentionalPrefill(body))
 		if modelInfo.Provider == "minimax" || modelInfo.Provider == "minimax-cn" {
@@ -206,14 +285,16 @@ func (h *ChatHandler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	workingBody["stream"] = reqBody.Stream
 	ctx := handlerutil.WithSessionID(r.Context(), handlerutil.ExtractSessionID(r))
-	ctx = handlerutil.WithClientAnthropicBeta(ctx, r.Header.Get("anthropic-beta"))
-	// Store requested model for streaming echo (PR #3693) and for [1m] marker handling
 	ctx = translator.WithRequestedModel(ctx, stripModelContextMarker(reqBody.Model))
+	// Record the dispatching key so the outbound guardrail tap can resolve the
+	// policy scoped to it. A keyless caller leaves it unset and the tap stays
+	// inert.
+	ctx = withGuardrailKey(ctx, requestKeyID(r))
 
 	requiredCaps := DetectRequiredCapabilities(body)
 
 	if len(modelInfo.ComboModels) > 0 {
-		augmented, comboStrategy, injected := h.applyCapacityAdapter(modelInfo.ComboModels, requiredCaps, modelInfo.Strategy, reqBody.Model)
+		augmented, comboStrategy, injected := h.applyCapacityAdapter(modelInfo.ComboModels, requiredCaps, modelInfo.Strategy, reqBody.Model, requestKeyID(r))
 		if modelInfo.Strategy == "fusion" {
 			bodyJSON, err := json.Marshal(workingBody)
 			if err != nil {
@@ -232,7 +313,7 @@ func (h *ChatHandler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(targetEntry, "/") && modelInfo != nil && modelInfo.Provider != "" {
 		targetEntry = modelInfo.Provider + "/" + modelInfo.Model
 	}
-	augmented, strat := h.AugmentModelsWithCapacityAdapter([]string{targetEntry}, requiredCaps)
+	augmented, strat := h.AugmentModelsWithCapacityAdapter([]string{targetEntry}, requiredCaps, requestKeyID(r))
 	if len(augmented) > 1 {
 		injected := augmented[:len(augmented)-1]
 		log.Info("chat", "capacity adapter auto-switch messages", "target", reqBody.Model, "switched_to", augmented[0], "caps", keysString(requiredCaps))
@@ -287,18 +368,21 @@ func (h *ChatHandler) HandleVersionStatus(w http.ResponseWriter, r *http.Request
 	handlerutil.WriteJSON(w, http.StatusOK, status)
 }
 
-// HandleChangelog serves the CHANGELOG.md file or fetches it from remote with fallbacks.
+// HandleChangelog serves the changelog the dashboard renders: the released
+// CHANGELOG.md plus the pending per-PR fragments in .changes/, so work merged
+// but not yet released is still visible. See internal/changelogfrag for why
+// entries live in fragments rather than at the top of CHANGELOG.md.
+//
+// Each candidate directory is tried in turn because the binary runs from the
+// repository root in a dev checkout but from its own directory once installed;
+// the remote copy stays the last resort for a packaged build that ships neither.
 func (h *ChatHandler) HandleChangelog(w http.ResponseWriter, r *http.Request) {
-	candidates := []string{
-		"CHANGELOG.md",
-		"../CHANGELOG.md",
-		"../../CHANGELOG.md",
-	}
-	for _, path := range candidates {
-		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+	for _, dir := range changelogDirs() {
+		result := changelogfrag.Assemble(dir)
+		if result.Err == nil && result.Markdown != "" {
 			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
+			_, _ = w.Write([]byte(result.Markdown))
 			return
 		}
 	}
@@ -329,6 +413,14 @@ func (h *ChatHandler) HandleChangelog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	handlerutil.WriteJSONError(w, http.StatusNotFound, "changelog not found")
+}
+
+// changelogDirs lists the directories that may hold CHANGELOG.md and .changes/,
+// nearest first. It stays relative to the working directory rather than
+// resolving from the executable path, which is what lets a dev run started
+// from a subdirectory find the repository root.
+func changelogDirs() []string {
+	return []string{".", "..", "../.."}
 }
 
 // HandleToggleAutoUpdate enables or disables automatic updates in settings and runtime.
@@ -438,7 +530,12 @@ func queryFlagEnabled(v string) bool {
 func (h *ChatHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	mode := modelsListModeFromQuery(r)
 	result := h.buildModelsListResult(r.Context(), mode)
-	modelsJSON, err := json.Marshal(result.Models)
+	visible, err := h.filterModelsByAccess(requestKey(r), result.Models)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	modelsJSON, err := json.Marshal(visible)
 	if err != nil {
 		handlerutil.WriteJSONError(w, http.StatusInternalServerError, "failed to encode models")
 		return
@@ -459,6 +556,13 @@ func (h *ChatHandler) HandleModelsInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-key policy: a key that cannot dispatch the model gets no metadata
+	// for it either, so /v1/models/info cannot be used to probe the catalog.
+	if err := h.checkModelAccess(requestKey(r), modelID); err != nil {
+		writeModelAccessError(w, err)
+		return
+	}
+
 	modelInfo, err := h.resolveModel(modelID)
 	if err != nil {
 		handlerutil.WriteJSONError(w, http.StatusNotFound, fmt.Sprintf("model not found: %s", modelID))
@@ -467,13 +571,16 @@ func (h *ChatHandler) HandleModelsInfo(w http.ResponseWriter, r *http.Request) {
 
 	ctxLen, maxOut := h.declaredTokenLimitsFor(modelInfo.Provider, modelID)
 	if ctxLen == 0 || maxOut == 0 {
-		tableCtxLen, tableMaxOut := providers.GetModelTokenLimits(modelID)
+		// Same chain `capabilities` is built from in /v1/models, so the two
+		// endpoints agree (per-model caps → catalog → substring table).
+		caps := providers.GetCapabilitiesDetailForModel(modelInfo.Provider, modelID)
 		if ctxLen == 0 {
-			ctxLen = tableCtxLen
+			ctxLen = caps.ContextWindow
 		}
 		if maxOut == 0 {
-			maxOut = tableMaxOut
+			maxOut = caps.MaxOutput
 		}
+		ctxLen, maxOut = fillTokenLimitGaps(ctxLen, maxOut, modelID)
 	}
 
 	info := map[string]any{
@@ -508,8 +615,6 @@ func (h *ChatHandler) HandleModelsByKind(w http.ResponseWriter, r *http.Request)
 	var data []map[string]any
 	now := time.Now().Unix()
 
-	endpoint := "/v1/chat/completions"
-
 	for id, cfg := range providers.KnownProviders {
 		var match bool
 		switch kind {
@@ -531,37 +636,24 @@ func (h *ChatHandler) HandleModelsByKind(w http.ResponseWriter, r *http.Request)
 		if !match {
 			continue
 		}
-		if kind == "web" {
-			endpoint = "/v1/search"
-		}
-		if kind == "image" {
-			endpoint = "/v1/images/generations"
-		}
-		if kind == "tts" {
-			endpoint = "/v1/audio/speech"
-		}
-		if kind == "stt" {
-			endpoint = "/v1/audio/transcriptions"
-		}
-		if kind == "embedding" {
-			endpoint = "/v1/embeddings"
-		}
-		if kind == "systemone" {
-			endpoint = "/v1/systemone"
-		}
-		if kind == "image-to-text" {
-			endpoint = "/v1/chat/completions"
-		}
-
 		data = append(data, map[string]any{
 			"id":       id,
 			"object":   "model",
 			"kind":     kind,
 			"owned_by": id,
-			"endpoint": endpoint,
+			"endpoint": kindEndpoint(kind),
 			"created":  now,
 		})
 	}
+
+	// Per-key policy applies to the kind listing too — it is the same
+	// catalogue under a different filter, so it goes through the same filter.
+	visible, err := h.filterModelsByAccess(requestKey(r), kindEntriesAsModelInfo(data))
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	data = kindEntriesFromModelInfo(visible, kind, now)
 
 	if data == nil {
 		data = []map[string]any{}
@@ -629,6 +721,12 @@ func (h *ChatHandler) HandleModelLookup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Per-key policy before the lookup, so a denied model answers 403 instead
+	// of the 404 the client could not act on.
+	if err := h.checkModelAccess(requestKey(r), suffix); err != nil {
+		writeModelAccessError(w, err)
+		return
+	}
 	// Otherwise treat as provider/model ID lookup.
 	if m, ok := h.findModelForLookup(r.Context(), suffix); ok {
 		handlerutil.WriteJSON(w, http.StatusOK, m)

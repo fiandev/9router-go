@@ -19,6 +19,11 @@ type GeminiStreamState struct {
 	Usage                *OpenAIUsage
 	FinishReason         string
 	LastThoughtSignature string
+	// ToolCallCount counts functionCall parts emitted so far. It gives each
+	// OpenAI tool_call its own index (parallel calls must not share index 0)
+	// and turns a Gemini STOP into finish_reason "tool_calls" so clients like
+	// Zed run the tools instead of ending the turn.
+	ToolCallCount int
 }
 
 // GeminiFileData represents remote or uploaded files referenced by URI.
@@ -201,10 +206,7 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 			if tc.ID == "" || tc.Function.Name == "" {
 				continue
 			}
-			cleanID := tc.ID
-			if ts := strings.LastIndex(cleanID, "__ts__"); ts != -1 {
-				cleanID = cleanID[:ts]
-			}
+			cleanID := geminiCleanToolCallID(tc.ID)
 			tcID2Names[tc.ID] = append(tcID2Names[tc.ID], tc.Function.Name)
 			if cleanID != tc.ID {
 				tcID2Names[cleanID] = append(tcID2Names[cleanID], tc.Function.Name)
@@ -219,6 +221,20 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 	// Cursor into tcID2Names: each tool result takes the oldest unconsumed name
 	// for its id, so a reused tool_call_id cannot rename an earlier turn.
 	tcNameCursor := make(map[string]int)
+
+	// Gemini rejects a request whose functionCall ids repeat anywhere in the
+	// history, while an OpenAI tool_call_id is only unique within its own
+	// assistant turn. The uniquifier rewrites a repeated id to `<id>-2`, `-3`…
+	// as it is emitted, and geminiToolCallIDs queues those emitted ids per
+	// original id so the matching functionResponse answers with the same one.
+	//
+	// Uniqueness is per OCCURRENCE, not per id: two calls sharing an id must
+	// end up with different emitted ids, so the mapping is consumed in document
+	// order rather than memoised by id. Ids that were already unique pass
+	// through untouched, leaving a valid conversation byte-identical.
+	toolCallIDUniquifier := newToolCallIDUniquifier()
+	geminiToolCallIDs := make(map[string][]string)
+	toolIDCursor := make(map[string]int)
 
 	var systemParts []GeminiPart
 	for _, msg := range msgs {
@@ -276,7 +292,28 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 					ts = DefaultThinkingSignature
 				}
 				firstFunctionCallSeen = true
-				gp := GeminiPart{FunctionCall: &GeminiFunctionCall{Name: tc.Function.Name, Args: args}, ThoughtSignature: ts}
+				// Gemini validates functionCall id uniqueness across the WHOLE
+				// history and rejects the entire request with 400
+				// INVALID_ARGUMENT when one repeats. An OpenAI tool_call_id is
+				// only unique within its own assistant turn, so a long agent
+				// session can legitimately emit call_51859 at turn 14 and
+				// again at turn 22. Parity with openai-to-gemini.js.
+				//
+				// The uniquifier keys on the CLEAN id: the "__ts__<sig>"
+				// suffix is this gateway's private transport and must never
+				// reach the wire. Uniqueness is a property of the id Gemini
+				// sees, so that is the id to make unique.
+				cleanToolID := geminiCleanToolCallID(tc.ID)
+				emitID := toolCallIDUniquifier.next(cleanToolID)
+				geminiToolCallIDs[cleanToolID] = append(geminiToolCallIDs[cleanToolID], emitID)
+				if tc.ID != cleanToolID {
+					geminiToolCallIDs[tc.ID] = append(geminiToolCallIDs[tc.ID], emitID)
+				}
+				gp := GeminiPart{FunctionCall: &GeminiFunctionCall{
+					Name: tc.Function.Name,
+					Args: args,
+					ID:   emitID,
+				}, ThoughtSignature: ts}
 				parts = append(parts, gp)
 			}
 
@@ -286,21 +323,17 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 
 		case "tool":
 			content := extractContentString(msg.Content)
-			cleanID := msg.ToolCallID
-			if ts := strings.LastIndex(cleanID, "__ts__"); ts != -1 {
-				cleanID = cleanID[:ts]
-			}
+			cleanID := geminiCleanToolCallID(msg.ToolCallID)
+			// Prefer what the request itself proves (the assistant turn that
+			// made the call), then this gateway's own record of ids it minted.
+			// The id is never parsed: it may be Gemini's opaque token, in which
+			// case a "call_<name>_<n>" reading would invent a tool name.
 			name := nextToolNameForID(tcID2Names, tcID2Name, tcNameCursor, msg.ToolCallID, cleanID)
 			if name == "" {
+				name = GetGeminiToolCallName(msg.ToolCallID, "")
+			}
+			if name == "" {
 				name = cleanID
-				if strings.HasPrefix(name, "call_") {
-					rest := strings.TrimPrefix(name, "call_")
-					if lastUnderscore := strings.LastIndex(rest, "_"); lastUnderscore > 0 {
-						name = rest[:lastUnderscore]
-					} else {
-						name = rest
-					}
-				}
 			}
 			// Tool result content may be plain text or JSON.
 			// Gemini requires the result to be valid JSON.
@@ -311,9 +344,23 @@ func TranslateOpenAIToGemini(openaiBody []byte) ([]byte, error) {
 				// Wrap plain text as a JSON object
 				resultValue = map[string]string{"output": content}
 			}
+			// The response must carry the id the CALL was emitted with, or
+			// Gemini pairs it with nothing. Consume the queue in the same
+			// document order the calls were emitted in.
+			respID := cleanID
+			for _, key := range [2]string{msg.ToolCallID, cleanID} {
+				queued := geminiToolCallIDs[key]
+				i := toolIDCursor[key]
+				if i < len(queued) {
+					respID = queued[i]
+					toolIDCursor[key] = i + 1
+					break
+				}
+			}
 			parts := []GeminiPart{{
 				FunctionResponse: &GeminiFunctionResp{
 					Name:     name,
+					ID:       respID,
 					Response: &GeminiFuncResp{Result: resultValue},
 				},
 			}}
@@ -422,6 +469,69 @@ func extractThoughtSig(id string) string {
 	return ""
 }
 
+// geminiCleanToolCallID drops the "__ts__<sig>" transport suffix from a tool
+// call id, leaving the id the client actually sees. The suffix is a 9router-go
+// encoding for carrying a thought signature back to Gemini, so it must never
+// reach the wire nor appear on one side of a call/response pair only.
+func geminiCleanToolCallID(id string) string {
+	if ts := strings.LastIndex(id, "__ts__"); ts != -1 {
+		return id[:ts]
+	}
+	return id
+}
+
+// toolCallIDUniquifier rewrites duplicate tool_call_ids so every emitted
+// functionCall id is unique across the whole request.
+//
+// Gemini validates id uniqueness over the entire history and answers
+// 400 INVALID_ARGUMENT otherwise, while an OpenAI tool_call_id is only unique
+// within its own assistant turn. Parity with createToolCallIdUniquifier in
+// open-sse/translator/request/openai-to-gemini.js.
+type toolCallIDUniquifier struct {
+	used map[string]bool
+}
+
+func newToolCallIDUniquifier() *toolCallIDUniquifier {
+	return &toolCallIDUniquifier{used: make(map[string]bool)}
+}
+
+// next returns an id unique among those already handed out. The state is
+// deliberately NOT a map from id to a fixed replacement: two calls sharing an
+// id must end up with two DIFFERENT emitted ids, so each call takes the next
+// free slot rather than looking up a memoised answer.
+func (u *toolCallIDUniquifier) next(id string) string {
+	if id == "" {
+		return id
+	}
+	if !u.used[id] {
+		u.used[id] = true
+		return id
+	}
+	// An id may already end in "-2"; keep counting rather than collide again.
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s-%d", id, n)
+		if !u.used[candidate] {
+			u.used[candidate] = true
+			return candidate
+		}
+	}
+}
+
+// geminiToolCallID resolves the tool_call id for a functionCall part. Gemini's
+// own id wins when present: it is the only id Gemini will match a
+// functionResponse against. The generated form carries the tool name for
+// readability and the call's index for uniqueness — two parts in one chunk are
+// emitted inside a single clock tick, so UnixNano alone collides and the client
+// cannot match a result to its call.
+// Parity with `functionCall.id || \`${name}-${Date.now()}-${index}\`` in
+// open-sse/translator/response/gemini-to-openai.js.
+func geminiToolCallID(geminiID, name string, index int) string {
+	if geminiID != "" {
+		return geminiID
+	}
+	return fmt.Sprintf("call_%s_%d_%d", name, time.Now().UnixNano(), index)
+}
+
 // effortToBudget converts reasoning_effort string to thinking budget tokens.
 func effortToBudget(effort string) int {
 	switch effort {
@@ -476,7 +586,8 @@ func TranslateGeminiResponseToOpenAI(geminiBody []byte) ([]byte, *OpenAIUsage, e
 					args = []byte("{}")
 				}
 				fnName := UncloakToolName(part.FunctionCall.Name, nil)
-				id := fmt.Sprintf("call_%s_%d", fnName, len(toolCalls))
+				id := geminiToolCallID(part.FunctionCall.ID, fnName, len(toolCalls))
+				StoreGeminiToolCallName(id, fnName, "")
 				sig := part.ThoughtSignature
 				if sig == "" {
 					sig = lastSig
@@ -631,7 +742,14 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 						args = []byte("{}")
 					}
 					fnName := UncloakToolName(part.FunctionCall.Name, nil)
-					id := fmt.Sprintf("call_%s_%d", fnName, time.Now().UnixNano())
+					id := geminiToolCallID(part.FunctionCall.ID, fnName, state.ToolCallCount)
+					// The id is opaque (it may be Gemini's own token), so the tool
+					// it belongs to is recorded rather than encoded in it: a client
+					// that echoes only role:"tool" messages leaves the reverse
+					// direction with nothing else to pair the result by. The index
+					// in the generated form keeps parallel calls distinct —
+					// UnixNano alone does not, it does not tick within a chunk.
+					StoreGeminiToolCallName(id, fnName, state.MessageId)
 					sig := part.ThoughtSignature
 					if sig == "" {
 						sig = state.LastThoughtSignature
@@ -642,7 +760,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 					}
 					delta["tool_calls"] = []map[string]any{
 						{
-							"index": 0,
+							"index": state.ToolCallCount,
 							"id":    id,
 							"type":  "function",
 							"function": map[string]any{
@@ -651,6 +769,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 							},
 						},
 					}
+					state.ToolCallCount++
 				}
 				if len(delta) > 0 {
 					results = append(results, map[string]any{
@@ -673,6 +792,10 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 		// Finish reason
 		if candidate.FinishReason != "" {
 			openAIStop := geminiFinishToOpenAI(candidate.FinishReason)
+
+			if state.ToolCallCount > 0 && openAIStop == "stop" {
+				openAIStop = "tool_calls"
+			}
 
 			inputTokens, outputTokens, cachedTokens := 0, 0, 0
 			if geminiChunk.UsageMetadata != nil {
@@ -895,7 +1018,7 @@ func NormalizeGeminiContents(contents []GeminiContent) []GeminiContent {
 			if isGeminiPartEmpty(p) {
 				continue
 			}
-			validParts = append(validParts, p)
+			validParts = append(validParts, sanitizeGeminiFunctionResponsePart(p))
 		}
 		if len(validParts) == 0 {
 			continue

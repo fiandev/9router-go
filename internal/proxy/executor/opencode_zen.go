@@ -3,14 +3,14 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
-	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/translator"
 )
 
@@ -156,7 +156,7 @@ func stripOpenCodePrefix(model string, prefixes ...string) string {
 	for _, p := range prefixes {
 		clean = strings.TrimPrefix(clean, p+"/")
 	}
-	for _, p := range []string{"opencode-go/", "opencode/", "oc/", "antigravity/", "ag/"} {
+	for _, p := range []string{"opencode-go/", "opencode/", "oc/"} {
 		clean = strings.TrimPrefix(clean, p)
 	}
 	if parenIdx := strings.IndexByte(clean, '('); parenIdx != -1 {
@@ -394,14 +394,7 @@ func normalizeZenResponsesBody(body []byte, cleanModel string) ([]byte, error) {
 	delete(m, "max_tokens")
 	delete(m, "max_completion_tokens")
 
-	if effort, ok := m["reasoning_effort"].(string); ok {
-		m["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
-		delete(m, "reasoning_effort")
-	} else if rMap, ok := m["reasoning"].(map[string]any); ok {
-		if rMap["summary"] == nil {
-			rMap["summary"] = "auto"
-		}
-	}
+	applyZenResponsesReasoning(m)
 
 	if inList, ok := m["input"].([]any); ok {
 		clean := make([]any, 0, len(inList))
@@ -432,7 +425,46 @@ func normalizeZenResponsesBody(body []byte, cleanModel string) ([]byte, error) {
 
 	m["stream"] = true
 	m["store"] = false
-	return json.Marshal(m)
+	// Deterministic marshaling keeps the serialized request prefix stable
+	// across the turns of a session, which prefix-caching upstreams
+	// (deepseek) require.
+	return marshalStable(m)
+}
+
+// applyZenResponsesReasoning folds a Chat-shaped reasoning_effort into the
+// Responses wire format, which nests effort under reasoning:{effort,summary}
+// and rejects a top-level reasoning_effort outright (strict upstreams answer
+// "unknown parameter `reasoning_effort`"). An explicit "none" has no nested
+// equivalent and is expressed upstream by removing reasoning entirely — sending
+// effort "none" instead asks a model to think at the lowest level rather than
+// to not think, which is a different (and billable) request. Parity with the
+// openai-responses branch of applyFormat in
+// open-sse/translator/concerns/thinkingUnified.js.
+func applyZenResponsesReasoning(m map[string]any) {
+	effort, ok := m["reasoning_effort"].(string)
+	if !ok {
+		if existing, isMap := m["reasoning"].(map[string]any); isMap && existing["summary"] == nil {
+			existing["summary"] = "auto"
+		}
+		return
+	}
+	delete(m, "reasoning_effort")
+	if strings.EqualFold(strings.TrimSpace(effort), "none") {
+		delete(m, "reasoning")
+		return
+	}
+	if effort == "" {
+		return
+	}
+	reasoning, isMap := m["reasoning"].(map[string]any)
+	if !isMap {
+		reasoning = map[string]any{}
+	}
+	reasoning["effort"] = effort
+	if reasoning["summary"] == nil {
+		reasoning["summary"] = "auto"
+	}
+	m["reasoning"] = reasoning
 }
 
 // withJSONFields merges top-level fields into a JSON object body, leaving it
@@ -448,7 +480,7 @@ func withJSONFields(body []byte, fields map[string]any) []byte {
 		}
 		m[k] = v
 	}
-	out, err := json.Marshal(m)
+	out, err := marshalStable(m)
 	if err != nil {
 		return body
 	}

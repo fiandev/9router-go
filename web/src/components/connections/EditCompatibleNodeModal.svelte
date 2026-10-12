@@ -5,6 +5,7 @@
   import Input from '../../lib/ui/Input.svelte'
   import Modal from '../../lib/ui/Modal.svelte'
   import { api, type ProviderNode } from '../../api/client'
+  import { nodeFormSeed } from './nodeFormSeed'
 
   interface Props {
     isOpen: boolean
@@ -33,21 +34,42 @@
   let validation = $state<'success' | 'failed' | null>(null)
   let saving = $state(false)
 
-  // Seed the form from the node whenever it (re)opens, mirroring useEffect([node]).
+  // Seed once per open, not once per `node` object.
+  //
+  // The dashboard polls /api/provider-nodes every 10s and replaces the array,
+  // so `selectedNode` arrives here as a brand-new object with identical
+  // contents every tick. Keying the seed on that identity re-ran this effect
+  // while the user was still typing, overwriting every unsaved field with the
+  // stored value (issue #234). The stable identity of a node is its id, and a
+  // genuine edit — a different node, or a reopen — still has to reseed, or the
+  // form would open carrying the previous node's values.
+  //
+  // Plain variables, not $state: writing them must not be something the effect
+  // reads back and re-trigger on.
+  let seededNodeId: string | null = null
+  let wasOpen = false
+
   $effect(() => {
-    if (isOpen && node) {
-      formName = node.name || ''
-      // A node created before the field existed carries a uuid tail. Showing it
-      // as editable text would invite the user to "fix" a value they never
-      // chose, so the field starts empty and a blank submit keeps the random id.
-      formUrlSuffix = node.urlSuffixGenerated ? '' : node.urlSuffix || ''
-      formApiType = node.apiType === 'responses' ? 'responses' : 'chat'
-      formBaseUrl = node.baseUrl || (isAnthropic ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1')
-      checkKey = ''
-      checkModelId = ''
-      validation = null
-      saving = false
-    }
+    const open = isOpen
+    const id = node?.id ?? null
+    // A node that only arrives after the modal opened (id goes null -> id) is
+    // a first seed too, which is why identity is compared against the last
+    // seeded one rather than only against `wasOpen`.
+    const shouldSeed = open && !!node && (!wasOpen || id !== seededNodeId)
+    wasOpen = open
+    if (!shouldSeed || !node) return
+
+    seededNodeId = id
+    const seed = nodeFormSeed(node, isAnthropic)
+    formName = seed.name
+    formPrefix = seed.prefix
+    formUrlSuffix = seed.urlSuffix
+    formApiType = seed.apiType
+    formBaseUrl = seed.baseUrl
+    checkKey = ''
+    checkModelId = ''
+    validation = null
+    saving = false
   })
 
   let saveDisabled = $derived(

@@ -14,6 +14,7 @@ import (
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
 	"9router/proxy/internal/proxy/oauth"
 )
@@ -58,6 +59,11 @@ const (
 	// the provider's chat base URL).
 	v1mProbeURL   = "https://v1m.ir/v1/systemone"
 	v1mProbeModel = "rev-latest"
+	// MiniMax Code publishes its model catalogue on the agent gateway (the
+	// same endpoint the dashboard imports from), so a connection probe is a
+	// plain bearer call there: a 401/403 is the only invalid answer.
+	miniMaxCodeCatalogURL       = "https://agent.minimax.cn/mavis/api/v1/models?region=cn&buildEnv=prod"
+	miniMaxCodeGlobalCatalogURL = "https://agent.minimax.io/mavis/api/v1/models?region=en&buildEnv=prod"
 	// Upstream accepts any non-401/403 answer as proof the credentials work.
 	connectionBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
@@ -195,6 +201,11 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 	"qoder-cn":       {url: "https://openapi.qoder.com.cn/api/v1/userinfo", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
 	"kimi":           {checkExpiry: true, refreshable: true},
 	"kimi-coding":    {checkExpiry: true, refreshable: true},
+	// MiniMax Code publishes its own catalogue on the agent gateway, so the
+	// probe proves the credential the same way the quota read does — and the
+	// token is refreshable, unlike the API-key MiniMax providers.
+	"minimax-code":        {url: miniMaxCodeCatalogURL, method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer ", checkExpiry: true, refreshable: true},
+	"minimax-code-global": {url: miniMaxCodeGlobalCatalogURL, method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer ", checkExpiry: true, refreshable: true},
 	// A Muse Code subscription stores the minted Model API key as its bearer
 	// token, so the catalogue call proves the credential exactly the same way
 	// it does for a pasted dev.meta.ai key — and there is nothing to refresh,
@@ -318,6 +329,9 @@ func parseConnectionProbeData(raw map[string]any) connectionProbeData {
 // testSingleConnection mirrors testSingleConnection(id): resolve the proxy,
 // pre-check it, then run the api-key or OAuth probe.
 func (h *DashboardHandler) testSingleConnection(ctx context.Context, conn *models.ProviderConnection, data connectionProbeData, raw map[string]any) probeOutcome {
+	if conn != nil && providers.IsLocalByDesign(conn.Provider) {
+		ctx = proxy.WithAllowLoopback(ctx)
+	}
 	client, proxyURL := h.probeHTTPClient(data, raw)
 	if proxyURL != "" {
 		if err := probeProxyURL(ctx, proxyURL); err != nil {
@@ -381,8 +395,10 @@ func (h *DashboardHandler) probeHTTPClient(data connectionProbeData, raw map[str
 	if err != nil {
 		return nil, ""
 	}
+	tr := proxy.NewSafeTransport()
+	tr.Proxy = http.ProxyURL(parsed)
 	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+		Transport: tr,
 		Timeout:   connectionProbeTimeout,
 	}, proxyURLStr
 }
@@ -415,8 +431,10 @@ func probeProxyURL(ctx context.Context, proxyURLStr string) error {
 	ctx, cancel := context.WithTimeout(ctx, connectionProxyProbeTimeout)
 	defer cancel()
 
+	tr := proxy.NewSafeTransport()
+	tr.Proxy = http.ProxyURL(parsed)
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+		Transport: tr,
 		Timeout:   connectionProxyProbeTimeout,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.google.com/generate_204", nil)
@@ -937,6 +955,8 @@ func (h *DashboardHandler) persistProbeResult(conn *models.ProviderConnection, r
 
 	if out.refreshed && out.tokens != nil {
 		if out.tokens.AccessToken != "" {
+			prevAccess, _ := raw["accessToken"].(string)
+			oauth.SyncMirroredAPIKey(raw, conn.Provider, prevAccess, out.tokens.AccessToken)
 			raw["accessToken"] = out.tokens.AccessToken
 		}
 		if out.tokens.RefreshToken != "" {

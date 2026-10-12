@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { api, getStoredAPIKey, type APIKey, type ProviderConnection, type Settings } from '../../api/client'
+  import { emailPrivacy, formatEmailLabel } from '../../lib/privacy'
   import { copyToClipboard } from '../../lib/clipboard'
   import { getModelKind, getModelsByProviderId, PROVIDER_ID_TO_ALIAS } from '../../lib/models'
   import { parseCustomModelsResponse, subscribeCustomModelsChanged } from '../../lib/customModels'
   import type { ProviderCatalogItem } from '../../lib/providers'
   import Badge from '../../lib/ui/Badge.svelte'
-  import { getIconPath } from '../connections/types'
+  import ProviderArtwork from '../providers/ProviderArtwork.svelte'
   import { type MediaKind, MEDIA_KIND_INFO } from './mediaTypes'
   import NoAuthProxyCard from './NoAuthProxyCard.svelte'
   import TtsExampleCard from './TtsExampleCard.svelte'
@@ -187,17 +188,23 @@
 
   function handleOpenEditConn(conn: ProviderConnection) {
     editingConn = conn
-    editConnName = conn.displayName || conn.name || ''
+    editConnName = formatEmailLabel(conn.displayName || conn.name, $emailPrivacy) || ''
     isEditingActive = conn.isActive === 1
   }
 
   async function handleSaveEditedConn() {
     if (!editingConn) return
     try {
-      await api.updateConnection(editingConn.id, {
-        name: editConnName.trim(),
+      const payload: { name?: string; isActive?: number } = {
         isActive: isEditingActive ? 1 : 0
-      })
+      }
+      const trimmed = editConnName.trim()
+      const original = (editingConn.displayName || editingConn.name || '').trim()
+      const masked = formatEmailLabel(original, $emailPrivacy).trim()
+      if (trimmed !== original && trimmed !== masked) {
+        payload.name = trimmed || undefined
+      }
+      await api.updateConnection(editingConn.id, payload)
       editingConn = null
       onRefresh()
     } catch (err) {
@@ -599,7 +606,6 @@
     }
   }
 
-  let icon = $derived(getIconPath(provider.id))
 </script>
 
 <div class="flex flex-col gap-8 animate-fade-in max-w-7xl mx-auto">
@@ -618,13 +624,10 @@
         class="size-12 rounded-lg flex items-center justify-center shrink-0 border border-border/40 overflow-hidden"
         style="background-color: {provider.color ? provider.color + '15' : '#88888815'}"
       >
-        <img
-          src={icon}
+        <ProviderArtwork
+          id={provider.id}
           alt={provider.name}
-          width="48"
-          height="48"
-          class="object-contain size-8 rounded"
-          onerror={(e) => { (e.currentTarget as HTMLElement).style.display = 'none' }}
+          class="object-contain size-8 rounded text-sm leading-none font-semibold"
         />
       </div>
       <div class="min-w-0 flex-1">
@@ -641,6 +644,21 @@
               Get API Key
             </a>
           {/if}
+          <!-- Media tabs never mount the Providers view, so without a toggle
+               here the masking applied elsewhere is unreachable from the
+               seven tabs that mount this component. -->
+          <button
+            type="button"
+            onclick={() => emailPrivacy.toggle()}
+            aria-pressed={$emailPrivacy}
+            class="ml-auto flex h-8 shrink-0 items-center gap-1 rounded-lg border px-2 text-xs transition-colors cursor-pointer {$emailPrivacy
+              ? 'border-brand-500/40 bg-brand-500/10 text-brand-500 font-medium'
+              : 'border-border-subtle bg-surface text-text-muted hover:text-text-main hover:bg-surface-2'}"
+            title={$emailPrivacy ? 'Show full email' : 'Mask / hide email'}
+          >
+            <span class="material-symbols-outlined text-[16px]">{$emailPrivacy ? 'visibility_off' : 'visibility'}</span>
+            <span class="hidden sm:inline">{$emailPrivacy ? 'Email Masked' : 'Mask Email'}</span>
+          </button>
         </div>
         <div class="flex items-center gap-1.5 mt-1 flex-wrap">
           {#each provider.serviceKinds || [] as sk}
@@ -744,7 +762,7 @@
                   </button>
                 </div>
                 <span class="material-symbols-outlined text-base text-text-muted shrink-0">key</span>
-                <span class="text-sm font-medium text-text-main truncate">{conn.displayName || conn.name || conn.email || conn.id}</span>
+                <span class="text-sm font-medium text-text-main truncate">{formatEmailLabel(conn.displayName || conn.name || conn.email || conn.id, $emailPrivacy)}</span>
                 <button
                   type="button"
                   onclick={() => handleToggleConnActive(conn)}
@@ -958,7 +976,7 @@
           >
             <option value="">Auto (by priority)</option>
             {#each providerConns as conn}
-              <option value={conn.id}>{conn.displayName || conn.name || conn.email || conn.id.slice(0, 8)}</option>
+              <option value={conn.id}>{formatEmailLabel(conn.displayName || conn.name || conn.email || conn.id.slice(0, 8), $emailPrivacy)}</option>
             {/each}
           </select>
         </div>

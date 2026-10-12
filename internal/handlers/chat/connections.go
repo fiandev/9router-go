@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"context"
 	json "encoding/json/v2"
 	"fmt"
 	"math/rand/v2"
@@ -12,10 +13,12 @@ import (
 
 	"9router/proxy/internal/constants"
 	"9router/proxy/internal/db"
+	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
 	internalproxy "9router/proxy/internal/proxy"
+	"9router/proxy/internal/proxy/oauth"
 	"9router/proxy/internal/translator"
 )
 
@@ -165,13 +168,23 @@ func (h *ChatHandler) GetBestConnection(provider string, connectionID string, ex
 	return h.getBestConnection(provider, connectionID, excludeIDs, model)
 }
 
+// GetBestConnectionWithContext is the context-aware variant of GetBestConnection.
+func (h *ChatHandler) GetBestConnectionWithContext(ctx context.Context, provider string, connectionID string, excludeIDs []string, model string) (*models.ProviderConnection, *ConnectionData, error) {
+	return h.getBestConnectionWithContext(ctx, provider, connectionID, excludeIDs, model)
+}
+
 func (h *ChatHandler) getBestConnection(provider string, connectionID string, excludeIDs []string, model string) (*models.ProviderConnection, *ConnectionData, error) {
+	return h.getBestConnectionWithContext(context.Background(), provider, connectionID, excludeIDs, model)
+}
+
+func (h *ChatHandler) getBestConnectionWithContext(ctx context.Context, provider string, connectionID string, excludeIDs []string, model string) (*models.ProviderConnection, *ConnectionData, error) {
 	if model != "" && !h.Repo.IsProviderAvailable(provider, model) {
 		log.Warn("health", "unhealthy provider", "provider", provider, "model", model)
 	}
 
 	var conn *models.ProviderConnection
 	var err error
+	isProbe := handlerutil.IsProbeContext(ctx)
 
 	if connectionID != "" {
 		conn, err = h.Repo.GetProviderConnectionByID(connectionID)
@@ -195,6 +208,13 @@ func (h *ChatHandler) getBestConnection(provider string, connectionID string, ex
 		// strategy. Honouring the pin unconditionally made the dashboard's
 		// enable/disable toggle a no-op for every pinned request.
 		ineligible, reason := h.pinnedConnectionIneligible(conn, excludeIDs, model)
+		if ineligible && isProbe && conn.IsActive == 1 && !slices.Contains(excludeIDs, conn.ID) {
+			if strings.HasPrefix(reason, "account cooldown") || strings.HasPrefix(reason, "model lock") || reason == "quota cache" {
+				// Probes bypass cooldown / locks to test actual upstream reachability,
+				// but must still honor model enablement, disabled accounts, and strict assignment.
+				ineligible = false
+			}
+		}
 		if ineligible {
 			log.Warn("connections", "pinned connection ineligible, falling back to strategy",
 				"provider", provider, "conn", conn.ID, "reason", reason)
@@ -281,21 +301,23 @@ func (h *ChatHandler) getBestConnection(provider string, connectionID string, ex
 			// Per-model lock and quota cache first: an account parked for
 			// this model carries no cooldown to shorten, so it must not enter
 			// the forced pool either (h.connectionModelBlocked).
-			if h.connectionModelBlocked(c, provider, model) {
-				continue
-			}
-			// Account-scoped cooldown. An account whose quota is spent, or
-			// whose OAuth grant the provider already rejected, is skipped
-			// before it is selected — round-robin otherwise kept handing out
-			// dead accounts until a live 429/401 locked them, and a rejected
-			// grant cost a token-endpoint call on every request until the IP
-			// was rate limited. Upstream parity: filterAvailableAccounts.
-			if until, ok := db.ConnectionBlockedUntil(c.Data); ok && until.After(now) {
-				inCooldown = append(inCooldown, c)
-				if cooldownUntil.IsZero() || until.Before(cooldownUntil) {
-					cooldownUntil = until
+			if !isProbe {
+				if h.connectionModelBlocked(c, provider, model) {
+					continue
 				}
-				continue
+				// Account-scoped cooldown. An account whose quota is spent, or
+				// whose OAuth grant the provider already rejected, is skipped
+				// before it is selected — round-robin otherwise kept handing out
+				// dead accounts until a live 429/401 locked them, and a rejected
+				// grant cost a token-endpoint call on every request until the IP
+				// was rate limited. Upstream parity: filterAvailableAccounts.
+				if until, ok := db.ConnectionBlockedUntil(c.Data); ok && until.After(now) {
+					inCooldown = append(inCooldown, c)
+					if cooldownUntil.IsZero() || until.Before(cooldownUntil) {
+						cooldownUntil = until
+					}
+					continue
+				}
 			}
 			conn = c
 			break
@@ -337,6 +359,21 @@ func (h *ChatHandler) getBestConnection(provider string, connectionID string, ex
 	if connData.ProxyPoolID == "" {
 		if poolID, ok := connData.ProviderSpecificData["proxyPoolId"].(string); ok && poolID != "" && poolID != "__none__" {
 			connData.ProxyPoolID = poolID
+		}
+	}
+
+	// providerSpecificData.baseUrl is where the dashboard stores a per-connection
+	// endpoint override (the Ollama Local host field, an Azure endpoint, the
+	// compatible-node URL). ConnectionData.BaseURL only carries the top-level
+	// baseUrl key, so an override written by the newer writer was parsed and then
+	// discarded — the request silently fell back to the registry default. Upstream
+	// reads the same nested field (open-sse/config/providers.js
+	// resolveOllamaLocalHost), so hydrate it here rather than in each caller.
+	if connData.BaseURL == "" {
+		if override, ok := connData.ProviderSpecificData["baseUrl"].(string); ok {
+			if trimmed := strings.TrimSpace(override); trimmed != "" {
+				connData.BaseURL = trimmed
+			}
 		}
 	}
 	// No per-connection binding: fall back to the pool assigned to the
@@ -496,13 +533,19 @@ func (h *ChatHandler) getProviderConfig(provider string, connData *ConnectionDat
 	var baseCfg *providers.ProviderConfig
 
 	if connData != nil && connData.BaseURL != "" {
+		// The override is completed to a chat-completions route: the dashboard
+		// stores a bare host for a self-hosted endpoint (the Ollama Local host
+		// field is typed as "http://192.168.1.10:11434"), and a host alone names
+		// no route, so the POST used to land on the server root. A URL that
+		// already names a route is passed through untouched.
+		baseURL := chatCompletionsURL(connData.BaseURL)
 		if cfg, ok := providers.KnownProviders[provider]; ok {
 			cloned := cfg
-			cloned.BaseURL = connData.BaseURL
+			cloned.BaseURL = baseURL
 			baseCfg = &cloned
 		} else {
 			baseCfg = &providers.ProviderConfig{
-				BaseURL:    connData.BaseURL,
+				BaseURL:    baseURL,
 				AuthHeader: constants.HeaderAuthorization,
 				AuthScheme: constants.AuthSchemeBearer,
 			}
@@ -517,16 +560,8 @@ func (h *ChatHandler) getProviderConfig(provider string, connData *ConnectionDat
 			return nil, fmt.Errorf("failed to look up provider node %s: %w", provider, err)
 		}
 		if node != nil && nodeData != nil && nodeData.BaseURL != "" {
-			baseURL := nodeData.BaseURL
-			if !strings.HasSuffix(baseURL, "/chat/completions") {
-				if strings.HasSuffix(baseURL, "/v1") || strings.HasSuffix(baseURL, "/v1/") {
-					baseURL = strings.TrimRight(baseURL, "/") + "/chat/completions"
-				} else {
-					baseURL = strings.TrimRight(baseURL, "/") + "/v1/chat/completions"
-				}
-			}
 			baseCfg = &providers.ProviderConfig{
-				BaseURL:    baseURL,
+				BaseURL:    chatCompletionsURL(nodeData.BaseURL),
 				AuthHeader: constants.HeaderAuthorization,
 				AuthScheme: constants.AuthSchemeBearer,
 			}
@@ -569,6 +604,78 @@ func (h *ChatHandler) getProviderConfig(provider string, connData *ConnectionDat
 	}
 
 	return h.applyProviderOverrides(provider, baseCfg), nil
+}
+
+// chatCompletionsURL completes a configured endpoint into the chat-completions
+// route, and leaves one that already names a route untouched.
+//
+// A configured endpoint arrives in one of two shapes: the full route, or a bare
+// host — the compatible-node baseUrl and the Ollama Local host field both take
+// this form, and a dotted IP is the common case
+// ("http://192.168.1.10:11434"). A bare host names no route upstream, so the
+// gateway's /v1 is what makes it a chat endpoint.
+//
+// Detection is by shape, not by guessing whether the last path segment looks
+// like a filename: an early version did that and exempted exactly the dotted-IP
+// host it existed to fix. A URL whose path is only a version prefix (/v1, and
+// the /v1beta Google uses) is that prefix plus the route; a path that carries
+// any segment beyond it is taken to be an endpoint the operator named, and is
+// left alone rather than having /v1 appended behind it.
+func chatCompletionsURL(baseURL string) string {
+	url := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if url == "" {
+		return baseURL
+	}
+	for _, route := range []string{
+		"/chat/completions", "/messages", "/responses", "/completions",
+		"/chat", "/embeddings", "/api/chat", "/api/generate",
+	} {
+		if strings.HasSuffix(url, route) {
+			return url
+		}
+	}
+	// Split off the scheme and authority, then decide from the path alone: no
+	// path at all, or only a version prefix, means nothing named an endpoint and
+	// the route is appended to the prefix that is there.
+	_, rest, found := strings.Cut(url, "://")
+	if !found {
+		return url + "/v1/chat/completions"
+	}
+	_, path, _ := strings.Cut(rest, "/")
+	switch trimmed := strings.Trim(path, "/"); {
+	case trimmed == "":
+		return url + "/v1/chat/completions"
+	case isVersionPrefix(trimmed):
+		// Already versioned ("https://host/v1"): the lane is the prefix plus the
+		// route, not a second prefix.
+		return url + "/chat/completions"
+	default:
+		// A path carrying a segment beyond the prefix names an endpoint the
+		// operator chose; appending behind it would only produce a 404.
+		return url
+	}
+}
+
+// isVersionPrefix reports whether a path segment is only an API version, as in
+// "/v1", "/v2", or Gemini's "/v1beta". Anything else names an endpoint of its
+// own and must not be treated as a prefix.
+func isVersionPrefix(segment string) bool {
+	rest, ok := strings.CutPrefix(segment, "v")
+	if !ok {
+		return false
+	}
+	digits, _ := strings.CutSuffix(rest, "beta")
+	return isDigits(digits)
+}
+
+// isDigits reports whether s is non-empty and every character is an ASCII digit.
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // applyProviderOverrides merges the operator's stored header overrides for a
@@ -627,7 +734,20 @@ func extractAPIKey(connData *ConnectionData) string {
 // 403 "The bearer token included in the request is invalid." even though the
 // access token is perfectly valid.
 func resolveProviderAuthToken(provider string, connData *ConnectionData, current string) string {
-	if connData == nil || provider != "kiro" {
+	if connData == nil {
+		return current
+	}
+	// Antigravity / gemini-cli authenticate with the OAuth access token only;
+	// apiKey there is a copy written at login that a refresh may not have
+	// rotated. Preferring it sent a stale token on every request, so each turn
+	// answered 401 and forced a refresh (oauth.SyncMirroredAPIKey heals the row).
+	if oauth.IsAccessTokenOnlyProvider(provider) {
+		if connData.AccessToken != "" {
+			return connData.AccessToken
+		}
+		return current
+	}
+	if provider != "kiro" {
 		return current
 	}
 	authMethod, _ := connData.ProviderSpecificData["authMethod"].(string)

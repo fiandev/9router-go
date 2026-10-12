@@ -1,10 +1,10 @@
 package chat
 
 import (
-	"9router/proxy/internal/constants"
 	"9router/proxy/internal/db"
 	"9router/proxy/internal/handlers/shared"
 	"9router/proxy/internal/log"
+	"9router/proxy/internal/middleware"
 	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
@@ -13,6 +13,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"9router/proxy/internal/semanticcache"
 )
 
 // NewChatHandler creates a ChatHandler with the given repository and a streaming-capable HTTP client.
@@ -29,14 +32,22 @@ func NewChatHandler(repo *db.Repo, ts ...*shared.TokenSaverConfig) *ChatHandler 
 	// start responding — closing the "accept then go silent" gap without
 	// killing a stream that has already begun.
 	var transport http.RoundTripper
-	if origTransport, ok := http.DefaultTransport.(*http.Transport); ok {
-		t := origTransport.Clone()
-		constants.DefaultHTTPTransportConfig.Configure(t)
-		transport = proxy.NewFallbackTransport(t)
-	} else if fb, ok := http.DefaultTransport.(*proxy.FallbackTransport); ok {
-		transport = fb
-	} else {
-		transport = proxy.NewFallbackTransport(http.DefaultTransport)
+	safeTransport := proxy.NewSafeTransport()
+	transport = proxy.NewFallbackTransport(safeTransport)
+	var sc *semanticcache.Cache
+	if cfg != nil {
+		ttl := time.Duration(cfg.SemanticCacheTTL()) * time.Minute
+		maxEntries := cfg.SemanticCacheMaxEntries()
+		var store semanticcache.Store
+		if repo != nil && repo.RawDB() != nil {
+			store = semanticcache.NewPersistentStore(repo.RawDB(), maxEntries, ttl)
+		}
+		sc = semanticcache.New(semanticcache.Config{
+			Enabled:             cfg.SemanticCacheEnabled(),
+			TTL:                 ttl,
+			MaxEntries:          maxEntries,
+			SimilarityThreshold: 0.95,
+		}, store, cfg.SemanticCacheEnabled)
 	}
 	return &ChatHandler{
 		Repo: repo,
@@ -45,7 +56,20 @@ func NewChatHandler(repo *db.Repo, ts ...*shared.TokenSaverConfig) *ChatHandler 
 			Timeout:   0, // no timeout for streaming support
 		},
 		TokenSaver:  cfg,
+		SemanticCache: sc,
 		stickyState: make(map[string]*comboStickyState),
+	}
+}
+
+// SetRateLimiter attaches the process-wide rate limiter so the metering path
+// can reconcile a TPM reservation against the turn's real token count.
+//
+// It is a setter rather than a constructor argument because the limiter is
+// built by the router (it needs the configured window), while the handler is
+// constructed by several call sites that do not care about rate limiting.
+func (h *ChatHandler) SetRateLimiter(rl *middleware.RateLimiter) {
+	if h != nil {
+		h.RateLimiter = rl
 	}
 }
 
@@ -125,33 +149,9 @@ func (h *ChatHandler) resolveModelEntryGuarded(entry string, visiting map[string
 		}
 	}
 
-	provider = routeModelToOwningProvider(provider, model)
 	return &ModelInfo{Provider: provider, Model: model}
 }
 
-// museSparkOwners are the providers whose upstream registry actually serves the
-// muse-spark family. Upstream open-sse registry lists these ids only under
-// opencode-zen / opencode-go, never under antigravity.
-var museSparkOwners = []string{"opencode", "opencode-go", "opencode-zen"}
-
-// routeModelToOwningProvider corrects a model requested under a provider that
-// does not serve it, so callers that reuse a dashboard-assigned prefix (e.g.
-// "ag/muse-spark-1.3-contributor-free" copied from a combo) reach the executor
-// that owns the model instead of failing upstream with 404/403.
-func routeModelToOwningProvider(provider, model string) string {
-	if provider != "antigravity" && provider != "antigravity-go" {
-		return provider
-	}
-	if !strings.Contains(model, "muse-spark") {
-		return provider
-	}
-	for _, owner := range museSparkOwners {
-		if _, ok := providers.KnownProviders[owner]; ok {
-			return owner
-		}
-	}
-	return provider
-}
 
 // flattenComboModels recursively expands combo-name entries into concrete
 // "provider/model" leaves, keeping order and deduping consecutive identical
@@ -254,7 +254,6 @@ func (h *ChatHandler) resolveModel(modelStr string) (*ModelInfo, error) {
 				}
 			}
 		}
-		provider = routeModelToOwningProvider(provider, model)
 		return &ModelInfo{Provider: provider, Model: model}, nil
 	}
 
